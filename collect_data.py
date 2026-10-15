@@ -108,10 +108,19 @@ def main():
     ap.add_argument("--macro-k", type=int, default=10, help="physics ticks per world-model transition")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=str, default="data/rollouts.npz")
+    ap.add_argument("--terrain-amplitude-max", type=float, default=0.0,
+                     help="m peak-to-peak random bumps -- MPCResidualEnv itself resamples a "
+                          "fresh amplitude in [0, this] at every reset() (same mechanism it "
+                          "already uses for speed_range/lateral_range/yaw_rate_range), so "
+                          "episodes span flat ground through this amplitude's worth of bumps, "
+                          "not a single fixed difficulty. 0.0 (default) reproduces Stage 1's "
+                          "flat-only data collection exactly.")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    env = MPCResidualEnv(episode_seconds=args.episode_seconds, seed=args.seed)
+    terrain_range = (0.0, args.terrain_amplitude_max) if args.terrain_amplitude_max > 0 else None
+    env = MPCResidualEnv(episode_seconds=args.episode_seconds, seed=args.seed,
+                          terrain_amplitude_range=terrain_range)
 
     def collect_n(n, tag):
         all_states, all_actions, all_next_states, episode_ids = [], [], [], []
@@ -141,7 +150,8 @@ def main():
              val_states=val_s, val_actions=val_a, val_next_states=val_ns,
              val_episode_ids=val_ep,
              hold_ticks=args.hold_ticks, macro_k=args.macro_k,
-             episode_seconds=args.episode_seconds)
+             episode_seconds=args.episode_seconds,
+             terrain_amplitude_max=args.terrain_amplitude_max)
     print(f"Saved dataset to {out_path}")
 
 

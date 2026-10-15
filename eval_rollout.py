@@ -52,6 +52,9 @@ def main():
     ap.add_argument("--macro-k", type=int, default=10)
     ap.add_argument("--seed", type=int, default=12345, help="distinct from training/val seeds")
     ap.add_argument("--record", type=str, default="media/rollout_comparison.png")
+    ap.add_argument("--terrain-amplitude-max", type=float, default=0.0,
+                     help="m peak-to-peak random bumps for the held-out episode -- see "
+                          "collect_data.py's own flag of the same name.")
     args = ap.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -61,7 +64,9 @@ def main():
     print(f"Loaded checkpoint from epoch {ckpt['epoch']} (val_loss={ckpt['val_loss']:.5f}).")
 
     rng = np.random.default_rng(args.seed)
-    env = MPCResidualEnv(episode_seconds=args.episode_seconds, seed=args.seed)
+    terrain_range = (0.0, args.terrain_amplitude_max) if args.terrain_amplitude_max > 0 else None
+    env = MPCResidualEnv(episode_seconds=args.episode_seconds, seed=args.seed,
+                          terrain_amplitude_range=terrain_range)
     states, actions, next_states = collect_episode(
         env, rng, args.episode_seconds, args.hold_ticks, args.macro_k)
     true_traj = np.concatenate([states[0:1], next_states], axis=0)   # (T+1, STATE_DIM)

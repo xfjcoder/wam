@@ -64,6 +64,14 @@ def main():
     ap.add_argument("--rollout-loss-weight", type=float, default=1.0)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight-decay", type=float, default=1e-5)
+    ap.add_argument("--grad-clip", type=float, default=1.0,
+                     help="max gradient norm -- the H-step rollout loss backprops through "
+                          "H repeated model applications (BPTT-style), which can produce "
+                          "occasional much larger gradients than the one-step loss ever "
+                          "does; without clipping, one outlier batch (confirmed: happened "
+                          "partway through a terrain-data training run, not seen on flat "
+                          "data) can corrupt the shared weights badly enough to visibly "
+                          "spike both losses for many subsequent epochs.")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -115,6 +123,7 @@ def main():
             loss = loss_fn(pred_delta_n, target_delta_n)
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
             one_step_loss += loss.item() * len(idx)
         one_step_loss /= n_train
@@ -132,6 +141,7 @@ def main():
             loss = (loss / H) * args.rollout_loss_weight
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
             roll_loss_total += loss.item()
         roll_loss_total /= args.rollout_batches_per_epoch

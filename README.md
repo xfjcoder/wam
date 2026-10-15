@@ -55,7 +55,7 @@ an existing one.
    comparison against the real simulator** -- DONE.
 2. **Use the learned model for planning/control** -- DONE.
 3. **Obstacle-aware planning, reusing `slam_sim`'s lidar + occupancy map** -- DONE.
-4. **Extend to uneven terrain** -- IN PROGRESS.
+4. **Extend to uneven terrain** -- DONE (partial/honest result, see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -230,6 +230,74 @@ failure mode -- a natural follow-on, not attempted here to keep this stage's own
     --record-robot media/robot.gif --record-map media/map.gif
 ```
 
+### Stage 4: extend to uneven terrain -- a genuine but partial result
+
+`MPCResidualEnv`'s own `terrain_amplitude_range` constructor argument already resamples a
+fresh random bump amplitude at every `reset()` (same mechanism it uses for
+speed/lateral/yaw-rate ranges) -- so `collect_data.py` and `eval_rollout.py` both gained a
+`--terrain-amplitude-max` flag that just threads a `(0.0, max)` range through, no new
+terrain-generation code needed.
+
+**Confirmed the generalization gap first, not assumed it:** Stage 1's flat-only checkpoint's
+open-loop rollout RMSE on terrain (0.08m bumps) is meaningfully worse than on flat ground --
+across 6 held-out seeds, mean RMSE 0.62 (flat) vs. **1.33** (terrain), driven mostly by leg
+joint-velocity error (qvel RMSE up to ~1.5-2x worse per-joint on terrain). Expected: terrain
+disturbances are an exogenous input the model never saw, not something the (state, action)
+pair alone can anticipate.
+
+**Collected a terrain-inclusive dataset and retrained** (`collect_data.py --terrain-amplitude-
+max 0.08`, 50 train + 10 val 10s episodes, 9708/1928 transitions -- comparable size to Stage
+1's flat dataset). The first training run surfaced a real instability: `one_step_loss` and
+`rollout_train_loss` both suddenly spiked ~8x around epoch 100 (one outlier batch through the
+H-step rollout loss's repeated model composition producing an unusually large gradient --
+not seen on flat data, where the gradient magnitudes stay smaller throughout) and only
+partially recovered by epoch 199. **Fixed with gradient-norm clipping** (`--grad-clip 1.0`,
+now on by default in `train_world_model.py`) -- the retrained run's loss curve was smooth
+throughout, with a better best checkpoint (val rollout MAE 0.297 vs. 0.340 without clipping).
+
+**Evaluated across 6 held-out seeds per condition** (`eval_terrain.py`), not a single
+episode -- a single episode's RMSE was actually MISLEADING here: the first terrain-trained
+checkpoint happened to score *better* than the flat checkpoint on one specific held-out
+episode and *worse* on another, which would have supported opposite conclusions depending
+on which seed got tested. See [[go1-review-before-trusting]].
+
+| condition | mean RMSE | std |
+|---|---|---|
+| flat-trained model, flat ground | 0.62 | 0.23 |
+| flat-trained model, terrain | 1.33 | 0.73 |
+| terrain-trained model, flat ground | 0.86 | 0.35 |
+| terrain-trained model, terrain | 1.03 | 0.43 |
+
+**Honest conclusion: a real but partial improvement, not a clean fix like Stages 1-3.**
+Training on terrain data measurably helps on terrain (mean RMSE down ~22%, std down ~40% --
+fewer of the occasional much-worse episodes the flat model produced on terrain) but doesn't
+fully close the gap back to flat-ground-level accuracy, and costs a real regression on flat
+ground itself (0.62 -> 0.86). This is the ordinary cost of broadening a training
+distribution to cover a harder case, not a bug -- the same trade-off `go1_rl_walk`'s own
+flat-vs-random-terrain RL staging ran into (see [[go1-staged-plan]]).
+
+**At the downstream navigation level, this difference didn't clearly show up.** Ran
+`navigate_wam.py` with `--terrain-amplitude 0.08` across the same 5 (seed, goal) pairs for
+both checkpoints: both reached 4/5 goals with similar times and final distances, and both
+fell on the SAME seed (200) -- suggesting that particular terrain realization was just hard
+for the real classical-MPC controller regardless of which learned model informed planning,
+not a world-model-accuracy effect. The modest rollout-accuracy edge the terrain-trained
+model has didn't translate into a visibly better navigation success rate at this sample
+size -- a genuinely inconclusive result at the planning level, reported as such rather than
+rounded up to a win.
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 collect_data.py \
+    --terrain-amplitude-max 0.08 --episodes 50 --val-episodes 10 --out data/rollouts_terrain.npz
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 train_world_model.py \
+    --data data/rollouts_terrain.npz --checkpoint checkpoints/world_model_terrain.pt
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 eval_terrain.py --trials 6
+```
+
+<p align="center">
+  <img src="media/rollout_comparison_terrain.png" width="620" alt="Five time-series panels comparing the real MuJoCo simulator on terrain (green, solid) against the terrain-trained world model's open-loop autoregressive rollout (purple, dashed)">
+</p>
+
 ## Repository layout
 
 ```
@@ -246,9 +314,13 @@ wam/
 ├── navigate_wam.py            # Stage 2: drive the real Go2 to a goal via the CEM planner
 ├── eval_navigate.py              # Stage 2: multi-seed comparison vs. navigate_mpc.py's laws
 ├── navigate_wam_obstacles.py       # Stage 3: obstacle-aware planning in slam_sim's island world
-├── data/rollouts.npz          # collected train/val transitions
-├── checkpoints/world_model.pt   # best (lowest val rollout error) trained checkpoint
+├── eval_terrain.py                   # Stage 4: multi-seed flat-vs-terrain model comparison
+├── data/rollouts.npz          # collected train/val transitions (flat ground)
+├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
+├── checkpoints/world_model.pt   # Stage 1-3's checkpoint (flat-ground data only)
+├── checkpoints/world_model_terrain.pt  # Stage 4's checkpoint (terrain-inclusive data)
 ├── media/rollout_comparison.png  # Stage 1's verification plot
+├── media/rollout_comparison_terrain.png  # Stage 4's verification plot (on terrain)
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo
 ├── media/navigate_wam_obstacles_*.gif  # Stage 3's before/after + occupancy-map demos
 ├── requirements.txt

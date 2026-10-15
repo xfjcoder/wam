@@ -53,7 +53,7 @@ an existing one.
 
 1. **Data collection + a simple MLP dynamics model, verified by open-loop rollout
    comparison against the real simulator** -- DONE.
-2. **(Follow-on) Use the learned model for planning/control** -- NOT STARTED.
+2. **Use the learned model for planning/control** -- DONE.
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -100,6 +100,69 @@ Needs `go1_rl_walk/mpc`'s own venv (`mujoco`, `torch`, `casadi`/`pinocchio` all 
     --checkpoint checkpoints/world_model.pt --record media/rollout_comparison.png
 ```
 
+### Stage 2: a learned-model CEM planner, replacing the hand-designed steering law
+
+The world model's own 33-dim state has no world-frame `(x, y, yaw)` in it (by design -- see
+"Scoping decisions"), so a planner that wants to reason about a world-frame goal has to
+dead-reckon pose itself from the state components the model *does* predict: body-frame
+forward/lateral velocity and yaw-rate, integrated forward each step (`wam/pose.py`, same
+body->world rotation convention `mpc_residual_env.py` itself uses). The planner
+(`wam/planner.py`'s `CEMPlanner`) is a standard shooting method: sample many candidate
+*constant* velocity commands, roll each one forward through the learned model for a short
+horizon (10 macro-steps = 0.5s) while dead-reckoning pose alongside it, score each rollout
+by final distance-to-goal + heading alignment + a stability penalty (keeping roll/pitch/
+height near the training distribution's own typical standing values, since the model was
+never trained on falls and can't be trusted to extrapolate into them), keep the best-scoring
+"elite" samples, refit the sampling distribution around them, and repeat for 3 iterations
+(cross-entropy method). Candidates are a single constant command across the whole horizon,
+not a freely time-varying sequence, deliberately: Stage 1's training data only ever changed
+its target command every 0.5s, so a constant-command rollout matches what the model
+actually saw during training, where a faster-switching sequence would ask it to extrapolate
+beyond its own training distribution.
+
+`navigate_wam.py` drives the real Go2 (same zero-RL-residual, classical-MPC convention as
+every other script here) toward a world-frame goal by replanning every 0.25s (5 macro-steps)
+with the CEM planner and holding its chosen command in between (rate-limited the same way
+`navigate_mpc.py`'s is, for the same QP-stability reason). Every tick still reads the REAL
+ground-truth pose from the simulator for "where am I now" -- only the planner's internal
+look-ahead rollout uses the learned model and its own dead-reckoned pose estimate to score
+candidates.
+
+**Evaluated against `go1_rl_walk/mpc/navigate_mpc.py`'s two hand-designed steering laws**
+(`strafe`: the original crab-toward-goal law; `turn`: turn-to-face + drive forward), across
+10 randomized (seed, goal) trials -- same seeds/goals for all three methods, goals 1.5-3.0m
+away in a random direction, so the same initial state and target set is attempted by all
+three. See "go1-eval-method": judged across repeated randomized trials, not a single run.
+
+| method      | success | mean time-to-reach | mean final distance |
+|-------------|---------|---------------------|----------------------|
+| **wam (CEM planner)** | **10/10** | **3.28 s** | **0.043 m** |
+| mpc strafe  | 10/10   | 5.27 s              | 0.136 m              |
+| mpc turn    | 10/10   | 4.56 s              | 0.154 m              |
+
+All three reached every one of the 10 goals with zero falls -- the learned-model planner is
+just as reliable as the hand-designed laws here, and noticeably faster and more precise:
+~30-38% faster to reach, and 3-4x tighter on final distance (closer than the 0.15m arrival
+tolerance itself, vs. the analytic laws settling right around it). The gap is plausible, not
+just noise: the CEM planner jointly optimizes all 3 command dimensions (speed, lateral,
+yaw-rate) against the actual predicted outcome every replan, where `compute_nav_command`/
+`compute_nav_command_turn` are decoupled proportional laws recomputed from instantaneous
+error alone. Reproduce with:
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 eval_navigate.py \
+    --trials 10 --seconds 15 --base-seed 200 --goal-seed 7
+```
+
+<p align="center">
+  <img src="media/navigate_wam_demo.gif" width="480" alt="The real Go2, driven purely by the learned-model CEM planner's chosen velocity commands, turning to face and driving to a goal requiring roughly a 180-degree turn">
+</p>
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 navigate_wam.py \
+    --goal-x 3.0 --goal-y 1.0 --checkpoint checkpoints/world_model.pt --record out.gif
+```
+
 ## Repository layout
 
 ```
@@ -107,13 +170,18 @@ wam/
 ├── wam/
 │   ├── state.py     # the 33-dim state / 3-dim action this project predicts, sliced from
 │   │                  MPCResidualEnv's own 47-dim obs + info
-│   └── model.py       # the MLP dynamics model itself (delta prediction, built-in normalization)
+│   ├── model.py       # the MLP dynamics model itself (delta prediction, built-in normalization)
+│   ├── pose.py          # dead-reckon world (x, y, yaw) from the model's predicted v_body/w_body
+│   └── planner.py         # Stage 2: CEM shooting planner over the learned model
 ├── collect_data.py      # Stage 1: generate rollouts from the real Go2 + classical MPC
 ├── train_world_model.py   # Stage 1: one-step + H-step rollout loss training
 ├── eval_rollout.py          # Stage 1: open-loop rollout vs. real simulator, numeric + plot
+├── navigate_wam.py            # Stage 2: drive the real Go2 to a goal via the CEM planner
+├── eval_navigate.py              # Stage 2: multi-seed comparison vs. navigate_mpc.py's laws
 ├── data/rollouts.npz          # collected train/val transitions
 ├── checkpoints/world_model.pt   # best (lowest val rollout error) trained checkpoint
 ├── media/rollout_comparison.png  # Stage 1's verification plot
+├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo
 ├── requirements.txt
 └── README.md
 ```

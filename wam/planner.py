@@ -16,6 +16,12 @@ only every `hold_ticks` (0.5s), many macro-steps at a time -- a constant-action 
 matches that distribution, where a freely time-varying per-macro-step sequence would ask
 the model to extrapolate to action-switching rates it never saw in training.
 
+Stage 3 adds an optional obstacle cost: if `plan()` is given a set of currently-known
+occupied-cell centers (e.g. from a `slam_sim`-style lidar-built occupancy grid -- see
+`navigate_wam_obstacles.py`), each rollout step's predicted (x, y) is scored against the
+nearest occupied point, same vectorized shooting loop, no structural change to the method
+itself -- it's just one more additive cost term alongside distance-to-goal and stability.
+
 Needs torch (see repo's own venv note in requirements.txt).
 """
 from dataclasses import dataclass
@@ -45,7 +51,9 @@ class CEMPlanner:
     def __init__(self, model, speed_range, lateral_range, yaw_rate_range,
                  horizon_steps: int = 10, macro_dt: float = 0.05,
                  n_samples: int = 200, n_elites: int = 20, n_iters: int = 3,
-                 w_dist: float = 1.0, w_heading: float = 0.3, w_stability: float = 3.0):
+                 w_dist: float = 1.0, w_heading: float = 0.3, w_stability: float = 3.0,
+                 w_obstacle: float = 40.0, w_collision: float = 200.0,
+                 safety_margin: float = 0.5, collision_margin: float = 0.35):
         self.model = model
         self.lo = torch.tensor([speed_range[0], lateral_range[0], yaw_rate_range[0]])
         self.hi = torch.tensor([speed_range[1], lateral_range[1], yaw_rate_range[1]])
@@ -57,6 +65,10 @@ class CEMPlanner:
         self.w_dist = w_dist
         self.w_heading = w_heading
         self.w_stability = w_stability
+        self.w_obstacle = w_obstacle
+        self.w_collision = w_collision
+        self.safety_margin = safety_margin
+        self.collision_margin = collision_margin
         # Stability penalty is measured relative to the TRAINING distribution's own typical
         # standing state, not a hand-picked constant -- ties the penalty to what the model
         # actually learned from rather than a guessed nominal height/roll/pitch.
@@ -65,16 +77,21 @@ class CEMPlanner:
         self.nominal_pitch = float(model.state_mean[_PITCH])
 
     @torch.no_grad()
-    def plan(self, state, pose, goal_xy, warm_start=None) -> PlanResult:
+    def plan(self, state, pose, goal_xy, warm_start=None, obstacle_points=None) -> PlanResult:
         """state: (STATE_DIM,) current real state. pose: (x, y, yaw) current real pose
         (ground truth -- only the planner's internal ROLLOUT dead-reckons with the model;
         the state it starts from is always the real, measured one). goal_xy: (gx, gy).
         warm_start: previous plan()'s chosen action, used to center the first CEM
         iteration's sampling distribution (cheap and usually close to the new answer, since
-        goals move slowly relative to the replan rate)."""
+        goals move slowly relative to the replan rate). obstacle_points: optional (n_obs, 2)
+        array/tensor of currently-known occupied-cell centers (Stage 3) -- None (default)
+        recovers exactly Stage 2's goal-only behavior."""
         state0 = torch.as_tensor(state, dtype=torch.float32)
         x0, y0, yaw0 = (torch.as_tensor(v, dtype=torch.float32) for v in pose)
         gx, gy = goal_xy
+        obstacles = None
+        if obstacle_points is not None and len(obstacle_points) > 0:
+            obstacles = torch.as_tensor(obstacle_points, dtype=torch.float32)
 
         mean = (torch.as_tensor(warm_start, dtype=torch.float32) if warm_start is not None
                 else torch.zeros(3))
@@ -100,6 +117,13 @@ class CEMPlanner:
                 cost = cost + self.w_stability * (
                     (roll - self.nominal_roll) ** 2 + (pitch - self.nominal_pitch) ** 2
                     + (height - self.nominal_height) ** 2)
+
+                if obstacles is not None:
+                    nearest_dist = torch.cdist(
+                        torch.stack([x_b, y_b], dim=1), obstacles).amin(dim=1)
+                    soft = torch.clamp(self.safety_margin - nearest_dist, min=0.0) ** 2
+                    hard = (nearest_dist < self.collision_margin).float()
+                    cost = cost + self.w_obstacle * soft + self.w_collision * hard
 
             dist = torch.hypot(gx - x_b, gy - y_b)
             heading_err = torch.atan2(gy - y_b, gx - x_b) - yaw_b

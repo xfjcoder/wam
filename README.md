@@ -54,6 +54,8 @@ an existing one.
 1. **Data collection + a simple MLP dynamics model, verified by open-loop rollout
    comparison against the real simulator** -- DONE.
 2. **Use the learned model for planning/control** -- DONE.
+3. **Obstacle-aware planning, reusing `slam_sim`'s lidar + occupancy map** -- DONE.
+4. **Extend to uneven terrain** -- IN PROGRESS.
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -163,6 +165,71 @@ error alone. Reproduce with:
     --goal-x 3.0 --goal-y 1.0 --checkpoint checkpoints/world_model.pt --record out.gif
 ```
 
+### Stage 3: obstacle-aware planning, reusing `slam_sim`'s lidar + occupancy map
+
+Everything sensing/mapping-related here is reused COMPLETELY UNMODIFIED from the sibling
+`slam_sim` project's own earlier stages, not re-derived: `slam.world.World.loop_corridor()`
+(a 12x8m rectangle with a 4x4m island in the middle -- a straight line between opposite
+corners is blocked, forcing genuine routing around it), `demo_stage6_go2_world.py`'s
+`build_env_xml`/wall-injection for putting that island into the real Go2's MuJoCo scene,
+`slam.mj_lidar.mj_lidar_scan`'s real ray-cast lidar, and `slam.occupancy_grid.OccupancyGrid`
+for the log-odds map those scans build up over time. This stage only adds the planning
+side: `wam/planner.py`'s `CEMPlanner` now accepts an `obstacle_points` argument (the
+occupancy grid's currently-known occupied cell centers) and scores every candidate
+rollout's predicted (x, y) against the nearest one -- a soft quadratic penalty inside a
+0.5m safety margin, plus a large flat penalty if a rollout predicts actually crossing a
+0.35m collision margin. Deliberately uses the REAL ground-truth pose (not `slam_sim`'s own
+ICP-corrected belief pose) to build the map -- localization-under-drift is a separate,
+already-solved problem over in `slam_sim`'s Stage 4/6; this stage's new ground is planning
+around what's been sensed, not re-demonstrating localization. One real consequence: the map
+only contains what's been scanned so far, so the planner can only avoid what it has already
+seen, same as any real lidar-then-plan stack.
+
+**Confirmed the obstacle cost is actually necessary, not just harmless:** with it disabled
+(`--disable-obstacle-cost`, Stage 2's planner unchanged), the robot drives straight at the
+island and falls/QP-fails almost immediately (final distance 7.6-7.8m from a ~10.3m start).
+With it enabled, the same goal is reached safely, routing around the island:
+
+<p align="center">
+  <img src="media/navigate_wam_obstacles_baseline_crash.gif" width="340" alt="Without the obstacle cost, the planner drives the real Go2 straight at the island obstacle and it falls">
+  <img src="media/navigate_wam_obstacles_robot.gif" width="340" alt="With the obstacle cost, the planner routes the real Go2 around the island to reach the same goal">
+</p>
+<p align="center">
+  <img src="media/navigate_wam_obstacles_map.gif" width="480" alt="Overhead view: the occupancy grid building up from lidar scans as the robot (green trail) routes around the island toward the goal">
+</p>
+
+**Evaluated across 4 start/goal pairs in the same world** (one with no obstacle in the way,
+as a sanity check the planner doesn't detour needlessly; three forcing a real detour around
+different sides/corners of the island):
+
+| start &rarr; goal | obstacle in the way? | result |
+|---|---|---|
+| (1.5,1.5) &rarr; (1.5,6.5) | no (clear corridor) | reached in 5.9s -- no needless detour |
+| (1.5,1.5) &rarr; (10.5,6.5) | yes | reached in 30.5-31.6s (reproduced twice) |
+| (10.5,1.5) &rarr; (1.5,6.5) | yes | safe, but did not finish in 45s (final distance 2.96m) |
+| (1.5,6.5) &rarr; (10.5,1.5) | yes | safe, but did not finish in 45s (final distance 7.02m) |
+
+Zero falls across all 4 trials, including the two that didn't finish -- the obstacle cost's
+core safety claim held in every case. But it's not a uniformly efficient router: the two
+unfinished trials both stall near a sharp convex corner of the island, creeping at a few
+cm/s rather than committing to a decisive turn around it (one of these, given more time,
+eventually broke free and finished at 31.3s -- not stuck forever, just slow and
+inconsistent). This is a real, explainable limitation of this specific design, not a bug:
+the obstacle cost only ever looks at where the planner's own SHORT (0.5s), DEAD-RECKONED
+rollout predicts the robot will be -- near a sharp corner, small pose-integration error
+inside that short horizon can make a genuinely-clear turn look like it still clips the
+safety margin, so the CEM settles for a locally-safe near-zero-progress crawl instead. A
+geometric path planner (e.g. A* over the occupancy grid, feeding the CEM planner a
+waypoint beyond the corner rather than the raw goal) is the standard fix for exactly this
+failure mode -- a natural follow-on, not attempted here to keep this stage's own scope to
+"can a learned-model planner be made obstacle-aware at all", which it demonstrably can.
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 navigate_wam_obstacles.py \
+    --goal-x 10.5 --goal-y 6.5 --checkpoint checkpoints/world_model.pt \
+    --record-robot media/robot.gif --record-map media/map.gif
+```
+
 ## Repository layout
 
 ```
@@ -172,16 +239,18 @@ wam/
 │   │                  MPCResidualEnv's own 47-dim obs + info
 │   ├── model.py       # the MLP dynamics model itself (delta prediction, built-in normalization)
 │   ├── pose.py          # dead-reckon world (x, y, yaw) from the model's predicted v_body/w_body
-│   └── planner.py         # Stage 2: CEM shooting planner over the learned model
+│   └── planner.py         # Stage 2/3: CEM shooting planner, optional obstacle cost
 ├── collect_data.py      # Stage 1: generate rollouts from the real Go2 + classical MPC
 ├── train_world_model.py   # Stage 1: one-step + H-step rollout loss training
 ├── eval_rollout.py          # Stage 1: open-loop rollout vs. real simulator, numeric + plot
 ├── navigate_wam.py            # Stage 2: drive the real Go2 to a goal via the CEM planner
 ├── eval_navigate.py              # Stage 2: multi-seed comparison vs. navigate_mpc.py's laws
+├── navigate_wam_obstacles.py       # Stage 3: obstacle-aware planning in slam_sim's island world
 ├── data/rollouts.npz          # collected train/val transitions
 ├── checkpoints/world_model.pt   # best (lowest val rollout error) trained checkpoint
 ├── media/rollout_comparison.png  # Stage 1's verification plot
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo
+├── media/navigate_wam_obstacles_*.gif  # Stage 3's before/after + occupancy-map demos
 ├── requirements.txt
 └── README.md
 ```

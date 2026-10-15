@@ -1,0 +1,10 @@
+# Not installed into a dedicated venv for this project -- every script here needs mujoco
+# (to run go1_rl_walk/mpc's MPCResidualEnv) AND torch (to train/run the world model), both
+# of which already live in go1_rl_walk/mpc's own venv. Run every script in this repo with:
+#   /home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 <script>.py
+#
+# Listed here for reference only (what that venv needs to already have):
+numpy
+torch>=2.1.0
+mujoco>=3.1.0
+matplotlib

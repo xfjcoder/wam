@@ -1,13 +1,17 @@
 """Stage 3: obstacle-aware planning -- the CEM planner from Stage 2 (wam/planner.py), now
-scoring candidate rollouts against a lidar-built occupancy map, not just the goal.
+scoring candidate rollouts against a lidar-built occupancy map, not just the goal. Stage 3b
+(wam/global_planner.py) adds an A* global planner over that same map, feeding the CEM a
+nearby waypoint instead of the (possibly far-away, behind-a-corner) true goal directly --
+this is what fixes the original Stage 3's corner-stall limitation, see README.
 
 Everything sensing/mapping-related is reused COMPLETELY UNMODIFIED from the sibling
 `slam_sim` project (its own Stage 1/2/6 work, not re-derived here): `slam.world.World` for
 the ground-truth wall layout, `demo_stage6_go2_world.build_env_xml` for injecting those
 walls into the real Go2's MuJoCo scene, `slam.mj_lidar.mj_lidar_scan` for the real ray-cast
 lidar, and `slam.occupancy_grid.OccupancyGrid` for the log-odds map those scans build up
-over time. This script only adds the planning side: feeding `grid.occupied_points()` into
-`CEMPlanner.plan()`'s new `obstacle_points` argument every replan.
+over time. This script adds the planning side: feeding `grid.occupied_points()` into
+`CEMPlanner.plan()`'s `obstacle_points` argument every replan, and (new) running
+`wam/global_planner.py`'s A* over that same grid to pick WHICH goal to hand the CEM.
 
 Deliberately uses the REAL ground-truth pose (from MPCResidualEnv's own info) to build the
 occupancy map, not slam_sim's ICP-corrected belief pose -- localization-under-drift is a
@@ -60,6 +64,7 @@ from slam.viz import render_frame, save_gif                     # noqa: E402
 from wam.model import WorldModel                            # noqa: E402
 from wam.planner import CEMPlanner                            # noqa: E402
 from wam.state import STATE_DIM, ACTION_DIM, extract_state    # noqa: E402
+from wam.global_planner import plan_path                      # noqa: E402
 
 
 def main():
@@ -83,6 +88,14 @@ def main():
                          help="plan with Stage 2's goal-only cost (ignores the occupancy "
                               "map entirely) -- for an intentional before/after comparison "
                               "against the obstacle-aware planner on the SAME island world.")
+    parser.add_argument("--disable-global-planner", action="store_true",
+                         help="keep the local CEM obstacle cost but drop the A* global "
+                              "waypoint path -- reproduces Stage 3's original corner-stall "
+                              "behavior, for an intentional before/after comparison.")
+    parser.add_argument("--robot-radius", type=float, default=0.35,
+                         help="inflation radius (m) used when A* decides which grid cells "
+                              "are passable -- should roughly match CEMPlanner's own "
+                              "collision-margin so the global path and local cost agree.")
     parser.add_argument("--lidar-beams", type=int, default=180)
     parser.add_argument("--lidar-every", type=int, default=10, help="control ticks between lidar scans")
     parser.add_argument("--occ-threshold", type=float, default=0.7)
@@ -146,6 +159,7 @@ def main():
 
     map_frames = []
     robot_frames = []
+    last_waypoints = None
 
     for step in range(1, max_steps + 1):
         dist = float(np.hypot(goal[0] - x, goal[1] - y))
@@ -160,13 +174,27 @@ def main():
             state = extract_state(obs, info_for_state)
             obstacle_pts = (None if args.disable_obstacle_cost
                              else grid.occupied_points(threshold=args.occ_threshold))
-            result = planner.plan(state, (x, y, yaw), tuple(goal), warm_start=target_action,
+
+            nav_goal = tuple(goal)
+            last_waypoints = None
+            if not args.disable_obstacle_cost and not args.disable_global_planner:
+                waypoints = plan_path(grid, (x, y), tuple(goal),
+                                       robot_radius=args.robot_radius,
+                                       occ_threshold=args.occ_threshold)
+                if waypoints:
+                    nav_goal = waypoints[0]
+                    last_waypoints = waypoints
+
+            result = planner.plan(state, (x, y, yaw), nav_goal, warm_start=target_action,
                                    obstacle_points=obstacle_pts)
             target_action = result.action.numpy()
             if args.verbose:
                 n_obs = 0 if obstacle_pts is None else len(obstacle_pts)
+                n_wp = 0 if last_waypoints is None else len(last_waypoints)
                 print(f"  t={step/200.0:5.1f}s pos=({x:+.2f},{y:+.2f}) yaw={yaw:+.2f} "
-                      f"dist={dist:.2f} action={target_action} n_obs={n_obs} cost={result.cost:.2f}")
+                      f"dist={dist:.2f} nav_goal=({nav_goal[0]:+.2f},{nav_goal[1]:+.2f}) "
+                      f"n_waypoints={n_wp} action={target_action} n_obs={n_obs} "
+                      f"cost={result.cost:.2f}")
 
         cur_fwd += np.clip(target_action[0] - cur_fwd, -max_cmd_delta, max_cmd_delta)
         cur_lat += np.clip(target_action[1] - cur_lat, -max_cmd_delta, max_cmd_delta)
@@ -184,8 +212,10 @@ def main():
             grid.update((x, y, yaw), ranges, hit, angles)
             n_lidar_scans += 1
             if args.record_map and n_lidar_scans % args.map_render_every == 0:
+                path_points = (np.array(last_waypoints) if last_waypoints is not None
+                               else None)
                 map_frames.append(render_frame(
-                    world, (x, y, yaw), occupancy_grid=grid,
+                    world, (x, y, yaw), occupancy_grid=grid, scan_points=path_points,
                     true_trail=np.array(true_trail) if len(true_trail) > 1 else None,
                     status_text=f"goal ({goal[0]:.1f},{goal[1]:.1f})"))
 

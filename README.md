@@ -54,7 +54,9 @@ an existing one.
 1. **Data collection + a simple MLP dynamics model, verified by open-loop rollout
    comparison against the real simulator** -- DONE.
 2. **Use the learned model for planning/control** -- DONE.
-3. **Obstacle-aware planning, reusing `slam_sim`'s lidar + occupancy map** -- DONE.
+3. **Obstacle-aware planning, reusing `slam_sim`'s lidar + occupancy map** -- DONE, including
+   a follow-on fix (Stage 3b: A* global waypoints) for the corner-stall limitation found
+   during Stage 3 itself.
 4. **Extend to uneven terrain** -- DONE (partial/honest result, see below).
 
 ### Stage 1: data collection, training, and open-loop verification
@@ -218,16 +220,48 @@ inconsistent). This is a real, explainable limitation of this specific design, n
 the obstacle cost only ever looks at where the planner's own SHORT (0.5s), DEAD-RECKONED
 rollout predicts the robot will be -- near a sharp corner, small pose-integration error
 inside that short horizon can make a genuinely-clear turn look like it still clips the
-safety margin, so the CEM settles for a locally-safe near-zero-progress crawl instead. A
-geometric path planner (e.g. A* over the occupancy grid, feeding the CEM planner a
-waypoint beyond the corner rather than the raw goal) is the standard fix for exactly this
-failure mode -- a natural follow-on, not attempted here to keep this stage's own scope to
-"can a learned-model planner be made obstacle-aware at all", which it demonstrably can.
+safety margin, so the CEM settles for a locally-safe near-zero-progress crawl instead.
 
 ```bash
 /home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 navigate_wam_obstacles.py \
     --goal-x 10.5 --goal-y 6.5 --checkpoint checkpoints/world_model.pt \
     --record-robot media/robot.gif --record-map media/map.gif
+```
+
+#### Stage 3b: A* global waypoints fix the corner-stall
+
+`wam/global_planner.py` adds exactly the fix flagged above: A* over the SAME occupancy grid
+(obstacle cells inflated by the robot's own collision margin), simplified by greedy
+line-of-sight "string-pulling" down to a handful of long, direct legs. Recomputed from
+scratch every CEM replan (receding-horizon, no waypoint-index state to carry across ticks --
+cheap on a map this size, ~10k cells). The CEM is then handed the nearest waypoint still in
+line-of-sight of the robot's current position as its goal, instead of the raw (possibly
+far-away, behind-a-corner) true goal -- so it only ever has to solve the easy local problem
+of walking a mostly-straight line, never "route around this obstacle" from scratch under a
+0.5s dead-reckoned horizon.
+
+<p align="center">
+  <img src="media/navigate_wam_astar_robot.gif" width="340" alt="With the A* global planner, the real Go2 smoothly rounds the island's sharp corner instead of stalling">
+  <img src="media/navigate_wam_astar_map.gif" width="340" alt="Overhead view: the A* waypoint path (blue dots) bending around the island corner, occupancy grid filling in from lidar">
+</p>
+
+**Multi-seed before/after on the same 4 start/goal pairs** (3 seeds each, `eval_obstacles.py`):
+
+| start &rarr; goal | A* disabled (Stage 3 original) | A* enabled (Stage 3b) |
+|---|---|---|
+| no obstacle (sanity check) | reached in 5.9-6.0s (all 3 seeds) | reached in 5.9-6.0s (all 3 seeds, unchanged) |
+| detour A | reached in 29.7-31.4s | reached in **14.3-14.4s** |
+| detour B (corner-stall case) | 2/3 seeds timed out (d=1.68-7.06m); 1 reached @39.9s | reached in **17.4-17.5s, all 3 seeds** |
+| detour C (corner-stall case) | 2/3 seeds timed out (d=7.04-7.07m); 1 reached @40.5s | reached in **13.6-14.3s, all 3 seeds** |
+
+12/12 trials reach the goal with A* enabled (up from 4/12 without it), roughly 2x faster
+even on the detour that didn't stall before, and the no-obstacle sanity check is completely
+unchanged -- confirming A* isn't adding needless detours where none are required. Zero falls
+in any trial, either condition. Reproduce with:
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 eval_obstacles.py \
+    --seeds 3 --base-seed 100 --seconds 45
 ```
 
 ### Stage 4: extend to uneven terrain -- a genuine but partial result
@@ -307,14 +341,16 @@ wam/
 │   │                  MPCResidualEnv's own 47-dim obs + info
 │   ├── model.py       # the MLP dynamics model itself (delta prediction, built-in normalization)
 │   ├── pose.py          # dead-reckon world (x, y, yaw) from the model's predicted v_body/w_body
-│   └── planner.py         # Stage 2/3: CEM shooting planner, optional obstacle cost
+│   ├── planner.py         # Stage 2/3: CEM shooting planner, optional obstacle cost
+│   └── global_planner.py    # Stage 3b: A* over the occupancy grid, feeds CEM a waypoint
 ├── collect_data.py      # Stage 1: generate rollouts from the real Go2 + classical MPC
 ├── train_world_model.py   # Stage 1: one-step + H-step rollout loss training
 ├── eval_rollout.py          # Stage 1: open-loop rollout vs. real simulator, numeric + plot
 ├── navigate_wam.py            # Stage 2: drive the real Go2 to a goal via the CEM planner
 ├── eval_navigate.py              # Stage 2: multi-seed comparison vs. navigate_mpc.py's laws
-├── navigate_wam_obstacles.py       # Stage 3: obstacle-aware planning in slam_sim's island world
-├── eval_terrain.py                   # Stage 4: multi-seed flat-vs-terrain model comparison
+├── navigate_wam_obstacles.py       # Stage 3/3b: obstacle-aware planning in slam_sim's island world
+├── eval_obstacles.py                 # Stage 3b: multi-seed A*-enabled vs. disabled comparison
+├── eval_terrain.py                     # Stage 4: multi-seed flat-vs-terrain model comparison
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── checkpoints/world_model.pt   # Stage 1-3's checkpoint (flat-ground data only)
@@ -323,6 +359,7 @@ wam/
 ├── media/rollout_comparison_terrain.png  # Stage 4's verification plot (on terrain)
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo
 ├── media/navigate_wam_obstacles_*.gif  # Stage 3's before/after + occupancy-map demos
+├── media/navigate_wam_astar_*.gif        # Stage 3b's corner-stall-fixed demos
 ├── requirements.txt
 └── README.md
 ```

@@ -51,6 +51,11 @@ def run_trial(method: str, seed: int, goal, seconds: float, checkpoint: str):
         cmd = [str(PYTHON), str(WAM_DIR / "navigate_wam.py"),
                "--goal-x", str(gx), "--goal-y", str(gy), "--seed", str(seed),
                "--seconds", str(seconds), "--checkpoint", checkpoint]
+    elif method == "wam-chunked":
+        cmd = [str(PYTHON), str(WAM_DIR / "navigate_wam_chunked.py"),
+               "--goal-x", str(gx), "--goal-y", str(gy), "--seed", str(seed),
+               "--seconds", str(seconds), "--checkpoint",
+               "checkpoints/world_model_chunked_large.pt"]
     elif method in ("mpc-strafe", "mpc-turn"):
         steering = "strafe" if method == "mpc-strafe" else "turn"
         cmd = [str(PYTHON), str(NAVIGATE_MPC),
@@ -59,7 +64,7 @@ def run_trial(method: str, seed: int, goal, seconds: float, checkpoint: str):
     else:
         raise ValueError(method)
     t0 = time.time()
-    proc = subprocess.run(cmd, cwd=str(WAM_DIR if method == "wam" else NAVIGATE_MPC.parent),
+    proc = subprocess.run(cmd, cwd=str(WAM_DIR if method in ("wam", "wam-chunked") else NAVIGATE_MPC.parent),
                            capture_output=True, text=True, timeout=seconds + 60)
     wall = time.time() - t0
     status, t_reach, final_dist = parse_result(proc.stdout)

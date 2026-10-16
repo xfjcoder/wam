@@ -60,6 +60,8 @@ an existing one.
 4. **Extend to uneven terrain** -- DONE (partial/honest result, see below).
 5. **Combine obstacle-aware planning with uneven terrain** -- DONE (found and fixed a real
    teleport/terrain-height bug along the way; honest bounded result, see below).
+6. **A history-conditioned, action-chunked world model** -- DONE (clear rollout-accuracy
+   win once scaled up; no downstream navigation win, and slower planning; see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -401,6 +403,65 @@ Reporting this plainly rather than cherry-picking the footstep-planning-on numbe
     --terrain-footstep-planning
 ```
 
+### Stage 6: a history-conditioned, action-chunked world model -- better predictions, no downstream win
+
+User asked to try ideas from Physical Intelligence-style "action chunking" architectures
+(pi0 and similar -- policy models, not dynamics models, but the same two ideas apply to a
+dynamics model): (1) condition on a short HISTORY of past (state, action) pairs, not just
+the instantaneous state, and (2) predict a whole CHUNK of future states jointly from a
+chunk of future actions in ONE non-autoregressive forward pass, instead of calling a
+single-step model repeatedly and feeding its own prediction back in.
+
+`wam/chunked_model.py`'s `ChunkedWorldModel`: a small causal transformer over a token
+sequence `[history_len past (state,action) pairs] + [current state, pivot] + [chunk_len
+future actions]`. Each future position predicts its delta relative to the CHUNK'S OWN
+START state (not the previous step -- the model never sees intermediate steps within one
+forward pass, that's the actual point of non-autoregressive prediction). Trained on the
+exact same data `collect_data.py` already produces (`train_chunked_world_model.py`), just
+windowed differently -- no new data collection needed.
+
+**First architecture (d_model=128, 2 layers) was only comparable to the existing MLP, not
+better** -- 6 paired held-out seeds: chunked mean RMSE 0.594 vs. MLP's 0.560, 5 of 6 seeds
+favoring the MLP. **Scaled up (d_model=256, 3 layers, more training epochs) and the result
+flipped cleanly**: mean RMSE 0.441 vs. 0.560, **6 of 6 seeds** favoring the chunked model
+(`eval_rollout_chunked.py`) -- a real, consistent ~21% improvement, not noise. The smaller
+architecture was genuinely under-capacity, not evidence the underlying idea doesn't work.
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 train_chunked_world_model.py \
+    --data data/rollouts.npz --checkpoint checkpoints/world_model_chunked_large.pt \
+    --d-model 256 --n-heads 8 --n-layers 3 --d-ff 512 --epochs 300
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 eval_rollout_chunked.py \
+    --chunked-checkpoint checkpoints/world_model_chunked_large.pt --seeds 6
+```
+
+**Built the planner integration anyway** (`wam/chunked_planner.py`'s `ChunkedCEMPlanner` +
+`ChunkedHistoryBuffer`, `navigate_wam_chunked.py`) to see whether the clear accuracy win
+translated downstream. It didn't, in either direction that matters:
+
+| method | success | mean time-to-goal | mean final distance | mean `plan()` wall-clock |
+|---|---|---|---|---|
+| `navigate_wam.py` (single-step MLP) | 10/10 | 3.29s | 0.046m | 12ms |
+| `navigate_wam_chunked.py` (chunked) | 10/10 | 3.30s | 0.064m | 164ms |
+
+Same 10 seeds/goals as Stage 2's own comparison. Success and time-to-goal are
+essentially identical; final-distance precision is slightly worse for the chunked
+planner (still well inside the 0.15m arrival tolerance, not a meaningful difference in
+practice); and the chunked planner's `plan()` call is **~13x slower** despite needing
+only 1 batched model call per horizon instead of 10 -- the transformer's per-call cost
+dominates over the savings from fewer calls, at least at this model size and `n_samples`.
+
+**Honest conclusion**: a genuinely better predictive model (clearly verified, 6/6 seeds)
+did not produce a better planner, and cost real planning speed -- the same "model
+accuracy isn't the bottleneck" lesson Stage 4/5 already found with the terrain-trained
+checkpoint, now showing up again with a structurally different model. Kept as working,
+verified infrastructure (not deleted), not adopted as the default checkpoint/planner.
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 navigate_wam_chunked.py \
+    --goal-x 3.0 --goal-y 1.0 --checkpoint checkpoints/world_model_chunked_large.pt
+```
+
 ## Repository layout
 
 ```
@@ -411,12 +472,17 @@ wam/
 │   ├── model.py       # the MLP dynamics model itself (delta prediction, built-in normalization)
 │   ├── pose.py          # dead-reckon world (x, y, yaw) from the model's predicted v_body/w_body
 │   ├── planner.py         # Stage 2/3: CEM shooting planner, optional obstacle cost
-│   └── global_planner.py    # Stage 3b: A* over the occupancy grid, feeds CEM a waypoint
+│   ├── global_planner.py    # Stage 3b: A* over the occupancy grid, feeds CEM a waypoint
+│   ├── chunked_model.py       # Stage 6: history-conditioned, action-chunked transformer
+│   └── chunked_planner.py      # Stage 6: CEM planner shooting through the chunked model
 ├── collect_data.py      # Stage 1: generate rollouts from the real Go2 + classical MPC
 ├── train_world_model.py   # Stage 1: one-step + H-step rollout loss training
+├── train_chunked_world_model.py  # Stage 6: trains chunked_model.py on the same data
 ├── eval_rollout.py          # Stage 1: open-loop rollout vs. real simulator, numeric + plot
+├── eval_rollout_chunked.py    # Stage 6: multi-seed chunked-vs-MLP rollout RMSE comparison
 ├── navigate_wam.py            # Stage 2: drive the real Go2 to a goal via the CEM planner
-├── eval_navigate.py              # Stage 2: multi-seed comparison vs. navigate_mpc.py's laws
+├── navigate_wam_chunked.py      # Stage 6: same, via the chunked model + planner
+├── eval_navigate.py              # Stage 2/6: multi-seed comparison (wam/wam-chunked/mpc laws)
 ├── navigate_wam_obstacles.py       # Stage 3/3b/5: obstacle-aware planning in slam_sim's island world
 ├── eval_obstacles.py                 # Stage 3b: multi-seed A*-enabled vs. disabled comparison
 ├── eval_terrain.py                     # Stage 4: multi-seed flat-vs-terrain model comparison
@@ -425,6 +491,7 @@ wam/
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── checkpoints/world_model.pt   # Stage 1-3's checkpoint (flat-ground data only)
 ├── checkpoints/world_model_terrain.pt  # Stage 4's checkpoint (terrain-inclusive data)
+├── checkpoints/world_model_chunked_large.pt  # Stage 6's chunked-model checkpoint
 ├── media/rollout_comparison.png  # Stage 1's verification plot
 ├── media/rollout_comparison_terrain.png  # Stage 4's verification plot (on terrain)
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo

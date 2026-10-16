@@ -68,6 +68,9 @@ an existing one.
    real load-bearing result once tuned, see below).
 9. **Velocity-extrapolated obstacle prediction** -- DONE (first attempt regressed safety;
    diagnosed and fixed a footprint-radius gap, then a real if narrow improvement; see below).
+10. **TWO independently-moving obstacles** -- DONE (architecture generalizes safely; found
+    and fixed two real tracker bugs; Stage 9's extrapolation win doesn't clearly repeat, a
+    genuine wash; see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -686,6 +689,73 @@ to the extrapolated term, the idea delivers a real, if narrow, improvement in bo
 margin and speed over Stage 8's frozen assumption. `--disable-extrapolation` keeps Stage 8's
 original frozen behavior available for comparison; extrapolation is the new default.
 
+### Stage 10: TWO independently-moving obstacles -- architecture generalizes safely, extrapolation's edge doesn't clearly repeat
+
+Everything through Stage 9 tracked exactly one dynamic blob. This stage adds a SECOND
+independently-moving obstacle to stress-test that assumption directly: `DynamicObstacleTracker`
+previously averaged all sensed "dynamic" points into one centroid -- with two obstacles
+sensed at once, that would blend them into one meaningless phantom point between them.
+
+**`wam/obstacle_tracker.py` generalized from one track to however many are live**: dynamic
+points are first CLUSTERED (radius-based union-find -- the two obstacles are spatially
+separated, no fancier clustering needed), then each scan's cluster centroids are matched to
+the PREVIOUS scan's tracked clusters by greedy nearest-centroid gating, so two obstacles
+moving in different directions keep separate position/velocity histories instead of being
+blended. `CEMPlanner.plan()`'s `dynamic_obstacle=(pos, vel)` became `dynamic_obstacles=[(pos,
+vel), ...]`, scored by nearest-of-all-of-them at each rollout step (same `cdist` + `amin`
+reduction the static term already used, so multiple obstacles don't double-count a penalty).
+
+**Default scenario**: the same (1.5, 1.5) &rarr; (1.5, 6.5) straight line, now with two
+obstacles at different heights along it (y=3.0 and y=5.5), each sweeping independently with a
+phase offset -- the robot generally has to react to each one separately, not just once.
+
+<p align="center">
+  <img src="media/navigate_wam_multi_robot.gif" width="340" alt="The real Go2 navigating past two independently-moving obstacles on its way to the blue goal marker">
+  <img src="media/navigate_wam_multi_map.gif" width="480" alt="Overhead view: occupancy grid, true path, goal and both obstacles' current positions annotated">
+</p>
+
+**Two real implementation bugs found and fixed while stress-testing, both via `--verbose`
+traces showing clearly wrong behavior, not guessed**:
+1. Spurious zero-velocity "ghost" tracks appeared at fixed positions near the island's
+   corner that matched neither real obstacle -- the one-time static-only reference scan
+   (Stage 9) was too sparse (1.5m vantage spacing) to see every wall cell from some angle, so
+   a live sighting of a genuinely static cell it missed had no nearby static point to match
+   against and got misclassified as a new moving obstacle. **Fixed** by scanning a denser
+   vantage grid (1.5m -> 0.6m spacing).
+2. A single real obstacle's own sensed points sometimes split into TWO separate tracks --
+   `cluster_radius` (0.5m) was smaller than the obstacle's own footprint diagonal (~0.85m for
+   a 0.6m box), so sparse-angle sightings of two different faces of the SAME box occasionally
+   failed to merge. **Fixed** by widening `cluster_radius` to 0.9m (still safely under the
+   >=2m separation between the two distinct obstacles in this scenario, so it never merges
+   them together).
+
+**Multi-seed/phase verification, three conditions** (8 phases, `eval_multi_obstacle.py`):
+
+| condition | success | fell | mean min-distance | worst-case min-distance | mean time-to-reach |
+|---|---|---|---|---|---|
+| obstacle cost disabled (goal-only) | 3/8 | 5 | 0.62m | 0.47m | 8.20s |
+| frozen at last-sensed position (Stage 8) | 8/8 | 0 | 0.77m | 0.64m | 10.94s |
+| velocity-extrapolated, per-track (Stage 9/10) | 8/8 | **0** | **0.80m** | 0.54m | 10.86s |
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 eval_multi_obstacle.py \
+    --trials 8 --seconds 30 --base-seed 300
+```
+
+**Honest conclusion**: the obstacle cost is still clearly necessary with two obstacles (3/8 ->
+8/8, same as Stage 8's single-obstacle result), and the tracker's generalization from one
+track to several is real and verified -- both conditions hold at zero falls once it's enabled.
+But Stage 9's clean, every-metric win from extrapolation does NOT clearly repeat here: mean
+min-distance is marginally better (0.80m vs. 0.77m) while worst-case margin is slightly WORSE
+(0.54m vs. 0.64m) and mean time-to-reach is essentially tied (10.86s vs. 10.94s) -- a wash, not
+a regression and not a repeat win. Likely cause, seen directly in `--verbose` traces: with two
+independent velocity estimates now feeding the rollout cost instead of one, the "safe window"
+the planner predicts shifts more often scan-to-scan, which occasionally made it linger
+indecisively near a wall rather than commit to a clean detour (one seed took 17.2s vs. 10.7s
+frozen) -- a cost not visible with only one tracked obstacle. Kept as the default regardless,
+since it's never worse at the thing that matters most (zero falls, comparable margins), but
+this is reported as a genuine mixed result, not rounded up to a second clean win.
+
 ## Repository layout
 
 ```
@@ -700,7 +770,7 @@ wam/
 │   ├── chunked_model.py       # Stage 6: history-conditioned, action-chunked transformer
 │   ├── chunked_planner.py      # Stage 6: CEM planner shooting through the chunked model
 │   ├── moving_obstacle.py       # Stage 8: mocap-body moving obstacle, injected into the XML
-│   └── obstacle_tracker.py       # Stage 9: dynamic-vs-static point classification + velocity tracking
+│   └── obstacle_tracker.py       # Stage 9/10: dynamic-vs-static classification + multi-track velocity tracking
 ├── collect_data.py      # Stage 1: generate rollouts from the real Go2 + classical MPC
 ├── train_world_model.py   # Stage 1: one-step + H-step rollout loss training
 ├── train_chunked_world_model.py  # Stage 6: trains chunked_model.py on the same data
@@ -717,6 +787,8 @@ wam/
 ├── navigate_wam_moving_obstacle.py      # Stage 8: obstacle-aware planning vs. a moving obstacle
 ├── eval_moving_obstacle.py                # Stage 8: multi-seed/phase obstacle-cost on/off comparison
 ├── eval_obstacle_extrapolation.py           # Stage 9: multi-seed/phase frozen-vs-extrapolated comparison
+├── navigate_wam_multi_obstacle.py             # Stage 10: obstacle-aware planning vs. TWO moving obstacles
+├── eval_multi_obstacle.py                       # Stage 10: multi-seed/phase 3-condition comparison
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── checkpoints/world_model.pt   # Stage 1-3's checkpoint (flat-ground data only)
@@ -730,6 +802,7 @@ wam/
 ├── media/navigate_wam_chunked_robot.gif  # Stage 6's chunked-model planner demo
 ├── media/navigate_wam_moving_*.gif         # Stage 8's moving-obstacle robot + map demos
 ├── media/navigate_wam_extrapolation_*.gif    # Stage 9's velocity-extrapolation robot + map demos
+├── media/navigate_wam_multi_*.gif              # Stage 10's two-obstacle robot + map demos
 ├── requirements.txt
 └── README.md
 ```

@@ -204,7 +204,7 @@ def main():
     map_frames = []
     robot_frames = []
     last_waypoints = None
-    last_dynamic_estimate = None
+    last_dynamic_estimates = []
 
     for step in range(1, max_steps + 1):
         t_now = step / 200.0
@@ -223,7 +223,7 @@ def main():
             state = extract_state(obs, info_for_state)
             all_occ_pts = (None if args.disable_obstacle_cost
                             else grid.occupied_points(threshold=args.occ_threshold))
-            dynamic_obstacle = None
+            dynamic_obstacles = []
             if all_occ_pts is None:
                 obstacle_pts = None
             elif tracker is not None:
@@ -231,8 +231,7 @@ def main():
                 # moving obstacle itself is pulled OUT of that frozen set and handed to the
                 # planner separately so it can be velocity-extrapolated per rollout step.
                 obstacle_pts = tracker.static_subset(all_occ_pts)
-                if last_dynamic_estimate is not None:
-                    dynamic_obstacle = last_dynamic_estimate
+                dynamic_obstacles = last_dynamic_estimates
             else:
                 # Stage 8's original behavior: every sensed point (including the moving
                 # obstacle's) frozen at its last-sensed position for the whole horizon.
@@ -249,15 +248,15 @@ def main():
                     last_waypoints = waypoints
 
             result = planner.plan(state, (x, y, yaw), nav_goal, warm_start=target_action,
-                                   obstacle_points=obstacle_pts, dynamic_obstacle=dynamic_obstacle,
+                                   obstacle_points=obstacle_pts, dynamic_obstacles=dynamic_obstacles,
                                    dynamic_obstacle_radius=args.obstacle_size)
             target_action = result.action.numpy()
             if args.verbose:
                 n_obs = 0 if obstacle_pts is None else len(obstacle_pts)
                 n_wp = 0 if last_waypoints is None else len(last_waypoints)
-                dyn_str = "none" if dynamic_obstacle is None else (
-                    f"pos=({dynamic_obstacle[0][0]:+.2f},{dynamic_obstacle[0][1]:+.2f}) "
-                    f"vel=({dynamic_obstacle[1][0]:+.2f},{dynamic_obstacle[1][1]:+.2f})")
+                dyn_str = "none" if not dynamic_obstacles else " ".join(
+                    f"[pos=({p[0]:+.2f},{p[1]:+.2f}) vel=({v[0]:+.2f},{v[1]:+.2f})]"
+                    for p, v in dynamic_obstacles)
                 print(f"  t={t_now:5.1f}s pos=({x:+.2f},{y:+.2f}) yaw={yaw:+.2f} "
                       f"dist={dist:.2f} obstacle=({obs_x:+.2f},{obs_y:+.2f}) "
                       f"n_waypoints={n_wp} action={target_action} n_obs={n_obs} "
@@ -280,7 +279,7 @@ def main():
             grid.update((x, y, yaw), ranges, hit, angles)
             n_lidar_scans += 1
             if tracker is not None:
-                last_dynamic_estimate = tracker.update(
+                last_dynamic_estimates = tracker.update(
                     grid.occupied_points(threshold=args.occ_threshold), t_now)
             if args.record_map and n_lidar_scans % args.map_render_every == 0:
                 path_points = (np.array(last_waypoints) if last_waypoints is not None

@@ -99,6 +99,15 @@ def main():
     parser.add_argument("--lidar-beams", type=int, default=180)
     parser.add_argument("--lidar-every", type=int, default=10, help="control ticks between lidar scans")
     parser.add_argument("--occ-threshold", type=float, default=0.7)
+    parser.add_argument("--terrain-amplitude-max", type=float, default=0.0,
+                         help="Stage 4/5: (0, max) m peak-to-peak random bumps added to the "
+                              "island world's ground, resampled at env reset -- 0.0 (default) "
+                              "reproduces Stage 3/3b's flat-ground behavior exactly.")
+    parser.add_argument("--terrain-footstep-planning", action="store_true",
+                         help="make the classical MPC's OWN footstep planner terrain-aware "
+                              "(go1_rl_walk's existing MPCResidualEnv flag, reused unmodified) "
+                              "instead of assuming flat touchdown height -- independent of "
+                              "the learned world model's own flat-vs-terrain checkpoints.")
     parser.add_argument("--max-accel", type=float, default=1.5)
     parser.add_argument("--max-yaw-accel", type=float, default=3.0)
     parser.add_argument("--seconds", type=float, default=30.0)
@@ -118,12 +127,25 @@ def main():
     tmp_dir = Path(tempfile.mkdtemp(prefix="wam_obstacles_"))
     xml_path = build_env_xml(world.walls, tmp_dir)
 
+    terrain_range = ((0.0, args.terrain_amplitude_max)
+                      if args.terrain_amplitude_max > 0 else None)
     env = MPCResidualEnv(
         xml_path=str(xml_path), episode_seconds=args.seconds,
         speed_range=(0.0, 0.0), lateral_range=(0.0, 0.0), yaw_rate_range=(0.0, 0.0),
-        seed=args.seed)
+        terrain_amplitude_range=terrain_range,
+        terrain_footstep_planning=args.terrain_footstep_planning, seed=args.seed)
     obs, _ = env.reset(seed=args.seed)
+    # reset() spawns the robot at its default (near-origin) position, where terrain is a
+    # flat start pad by construction -- teleporting x/y to an arbitrary --start-x/-y leaves
+    # qpos[2] (base height) still set for THAT pad's terrain height, not the new spot's. On
+    # flat ground (terrain disabled) both are 0 so this is a no-op; with terrain enabled and
+    # a start point off the pad, skipping this compensation spawns the robot either floating
+    # above or embedded inside a terrain bump -- confirmed directly: caused an instant
+    # fall/QP-failure within ~0.1m of every teleport, not a real planning or dynamics result.
+    terrain_h_before = env._terrain_height(env.mujoco_go2.data.qpos[0], env.mujoco_go2.data.qpos[1])
     env.mujoco_go2.data.qpos[0:2] = [args.start_x, args.start_y]
+    terrain_h_after = env._terrain_height(args.start_x, args.start_y)
+    env.mujoco_go2.data.qpos[2] += float(terrain_h_after - terrain_h_before)
     mj.mj_forward(env.mujoco_go2.model, env.mujoco_go2.data)
 
     planner = CEMPlanner(

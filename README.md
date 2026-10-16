@@ -58,6 +58,8 @@ an existing one.
    a follow-on fix (Stage 3b: A* global waypoints) for the corner-stall limitation found
    during Stage 3 itself.
 4. **Extend to uneven terrain** -- DONE (partial/honest result, see below).
+5. **Combine obstacle-aware planning with uneven terrain** -- DONE (found and fixed a real
+   teleport/terrain-height bug along the way; honest bounded result, see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -332,6 +334,73 @@ rounded up to a win.
   <img src="media/rollout_comparison_terrain.png" width="620" alt="Five time-series panels comparing the real MuJoCo simulator on terrain (green, solid) against the terrain-trained world model's open-loop autoregressive rollout (purple, dashed)">
 </p>
 
+### Stage 5: obstacle-aware planning on uneven terrain -- combining Stage 3b + Stage 4
+
+Neither prior stage tested this combination: Stage 3/3b's island world was flat ground, and
+Stage 4's downstream navigation check used the open, obstacle-free default world. `navigate_
+wam_obstacles.py` gained the same `--terrain-amplitude-max` passthrough as `collect_data.py`/
+`eval_rollout.py`, so the same island-plus-walls world used for obstacle avoidance can also
+have Stage 4's 0.08m random bumps.
+
+**Found and fixed a real bug this surfaced, not a planning/dynamics result:** the script
+teleports the robot to `--start-x/-y` after `env.reset()` by directly overwriting `qpos[0:2]`
+-- on flat ground this is harmless (ground height is 0 everywhere), but with terrain enabled
+it left `qpos[2]` (base height) set for the DEFAULT spawn point's terrain height, not the new
+start point's. Every affected trial fell within ~0.1-0.2m of start (confirmed: final distance
+after "falling" was ~4.8-4.9m out of a ~5.0m straight-line start-to-goal distance -- the
+robot barely moved before an instant, violent contact from spawning embedded in or floating
+above a terrain bump). **Fixed** by reading the terrain height at both the pre- and
+post-teleport position and shifting `qpos[2]` by the difference -- a no-op when terrain is
+disabled (both heights are 0), so Stage 3/3b's own flat-ground behavior is unaffected.
+
+**With that fixed, ran the real multi-seed comparison** (same 4 start/goal pairs, 3 seeds,
+both world-model checkpoints, terrain amplitude 0.08 -- `eval_obstacles_terrain.py`):
+
+| condition | trials reached |
+|---|---|
+| flat-trained model, obstacles + terrain | 5/12 |
+| terrain-trained model, obstacles + terrain | 3/12 |
+
+A much higher fall rate than either capability alone (Stage 3b: 12/12 on flat ground; Stage
+4's downstream check: 4/5 on open terrain with no obstacles) -- obstacle avoidance's sharper
+turns near walls, combined with real ground disturbance, is a genuinely harder combination.
+Notably, the SAME seeds fell for both checkpoints at similar final distances -- pointing away
+from "the world model's predictive accuracy is the bottleneck" (which checkpoint is loaded
+barely matters) and toward the classical MPC's footstep planner, which by default assumes
+flat touchdown height regardless of terrain (same naive-footstep design `go1_rl_walk`'s own
+Stage 11 terrain work already identified and built a fix for).
+
+**Reused that existing fix, unmodified**: `MPCResidualEnv`'s own `terrain_footstep_planning`
+flag (already implemented and validated in `go1_rl_walk`, just not previously threaded
+through this script) makes the footstep planner terrain-aware instead of assuming flat
+ground. Re-ran the same comparison with it enabled:
+
+| condition | trials reached |
+|---|---|
+| flat-trained model, obstacles + terrain, footstep-planning ON | 6/12 |
+| terrain-trained model, obstacles + terrain, footstep-planning ON | 6/12 |
+
+A real, replicable improvement (5/12 and 3/12 &rarr; 6/12 both) -- but not a full fix: one
+terrain draw (seed 301) fails on every single start/goal pair for both checkpoints even with
+footstep-aware planning, matching `go1_rl_walk/mpc`'s own documented finding that terrain-
+aware footstep planning alone still leaves a substantial QP-failure rate on hard terrain.
+Zero timeouts across all 48 trials in this stage (every result was either "reached" or
+"fell") -- Stage 3b's corner-stall fix holds even here; the remaining failures are
+terrain-induced falls, a different and lower-level problem than path planning.
+
+**Honest conclusion**: obstacle-aware planning and terrain generalization each work well on
+their own, but stacking them is a genuinely harder problem that neither this project's
+learned world model nor its CEM/A* planner can fix alone -- the bottleneck is the classical
+MPC's terrain-robustness, a `go1_rl_walk`-level limitation (already partially addressed
+there, not fully solved) rather than something to chase further inside `wam`'s own scope.
+Reporting this plainly rather than cherry-picking the footstep-planning-on numbers as a win.
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 eval_obstacles_terrain.py \
+    --seeds 3 --base-seed 300 --terrain-amplitude-max 0.08 --seconds 45 \
+    --terrain-footstep-planning
+```
+
 ## Repository layout
 
 ```
@@ -348,9 +417,10 @@ wam/
 ├── eval_rollout.py          # Stage 1: open-loop rollout vs. real simulator, numeric + plot
 ├── navigate_wam.py            # Stage 2: drive the real Go2 to a goal via the CEM planner
 ├── eval_navigate.py              # Stage 2: multi-seed comparison vs. navigate_mpc.py's laws
-├── navigate_wam_obstacles.py       # Stage 3/3b: obstacle-aware planning in slam_sim's island world
+├── navigate_wam_obstacles.py       # Stage 3/3b/5: obstacle-aware planning in slam_sim's island world
 ├── eval_obstacles.py                 # Stage 3b: multi-seed A*-enabled vs. disabled comparison
 ├── eval_terrain.py                     # Stage 4: multi-seed flat-vs-terrain model comparison
+├── eval_obstacles_terrain.py             # Stage 5: multi-seed obstacles+terrain comparison
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── checkpoints/world_model.pt   # Stage 1-3's checkpoint (flat-ground data only)

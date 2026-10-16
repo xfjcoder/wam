@@ -22,6 +22,13 @@ occupied-cell centers (e.g. from a `slam_sim`-style lidar-built occupancy grid -
 nearest occupied point, same vectorized shooting loop, no structural change to the method
 itself -- it's just one more additive cost term alongside distance-to-goal and stability.
 
+Stage 9 adds an optional SECOND obstacle term: `dynamic_obstacle=(pos0, vel)` is a single
+tracked point (e.g. `wam/obstacle_tracker.py`'s `DynamicObstacleTracker` estimate of a
+moving obstacle) that gets velocity-EXTRAPOLATED forward to each rollout step's own future
+time (`(h+1) * macro_dt` ahead of now) before being scored the same way -- unlike the
+static `obstacle_points` term, which stays frozen at wherever it was sensed for the whole
+horizon.
+
 Needs torch (see repo's own venv note in requirements.txt).
 """
 from dataclasses import dataclass
@@ -77,7 +84,8 @@ class CEMPlanner:
         self.nominal_pitch = float(model.state_mean[_PITCH])
 
     @torch.no_grad()
-    def plan(self, state, pose, goal_xy, warm_start=None, obstacle_points=None) -> PlanResult:
+    def plan(self, state, pose, goal_xy, warm_start=None, obstacle_points=None,
+             dynamic_obstacle=None, dynamic_obstacle_radius: float = 0.0) -> PlanResult:
         """state: (STATE_DIM,) current real state. pose: (x, y, yaw) current real pose
         (ground truth -- only the planner's internal ROLLOUT dead-reckons with the model;
         the state it starts from is always the real, measured one). goal_xy: (gx, gy).
@@ -85,13 +93,27 @@ class CEMPlanner:
         iteration's sampling distribution (cheap and usually close to the new answer, since
         goals move slowly relative to the replan rate). obstacle_points: optional (n_obs, 2)
         array/tensor of currently-known occupied-cell centers (Stage 3) -- None (default)
-        recovers exactly Stage 2's goal-only behavior."""
+        recovers exactly Stage 2's goal-only behavior; treated as frozen for the whole
+        horizon. dynamic_obstacle: optional (pos0, vel) pair, each a 2-vector -- Stage 9's
+        velocity-extrapolated moving-obstacle term, re-evaluated at each rollout step's own
+        future time instead of staying frozen. dynamic_obstacle_radius: the obstacle's own
+        physical footprint radius, added onto safety_margin/collision_margin for THIS term
+        only -- `obstacle_points`'s static safety-margin/collision-margin already gets a
+        comparable allowance "for free" from the occupancy grid's sensing/clearing lag (a
+        few recently-vacated cells near a moving obstacle stay marked occupied for a few
+        scans), but a single extrapolated point has no such built-in slack, so collapsing a
+        sensed cluster down to its centroid without this would silently shrink the avoided
+        region from the real object's full width down to a bare point."""
         state0 = torch.as_tensor(state, dtype=torch.float32)
         x0, y0, yaw0 = (torch.as_tensor(v, dtype=torch.float32) for v in pose)
         gx, gy = goal_xy
         obstacles = None
         if obstacle_points is not None and len(obstacle_points) > 0:
             obstacles = torch.as_tensor(obstacle_points, dtype=torch.float32)
+        dyn_pos0 = dyn_vel = None
+        if dynamic_obstacle is not None:
+            dyn_pos0 = torch.as_tensor(dynamic_obstacle[0], dtype=torch.float32)
+            dyn_vel = torch.as_tensor(dynamic_obstacle[1], dtype=torch.float32)
 
         mean = (torch.as_tensor(warm_start, dtype=torch.float32) if warm_start is not None
                 else torch.zeros(3))
@@ -123,6 +145,17 @@ class CEMPlanner:
                         torch.stack([x_b, y_b], dim=1), obstacles).amin(dim=1)
                     soft = torch.clamp(self.safety_margin - nearest_dist, min=0.0) ** 2
                     hard = (nearest_dist < self.collision_margin).float()
+                    cost = cost + self.w_obstacle * soft + self.w_collision * hard
+
+                if dyn_pos0 is not None:
+                    t_future = (h + 1) * self.macro_dt
+                    dyn_x = dyn_pos0[0] + dyn_vel[0] * t_future
+                    dyn_y = dyn_pos0[1] + dyn_vel[1] * t_future
+                    dyn_dist = torch.hypot(x_b - dyn_x, y_b - dyn_y)
+                    dyn_safety = self.safety_margin + dynamic_obstacle_radius
+                    dyn_collision = self.collision_margin + dynamic_obstacle_radius
+                    soft = torch.clamp(dyn_safety - dyn_dist, min=0.0) ** 2
+                    hard = (dyn_dist < dyn_collision).float()
                     cost = cost + self.w_obstacle * soft + self.w_collision * hard
 
             dist = torch.hypot(gx - x_b, gy - y_b)

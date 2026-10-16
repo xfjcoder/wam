@@ -53,6 +53,7 @@ from wam.planner import CEMPlanner                            # noqa: E402
 from wam.state import STATE_DIM, ACTION_DIM, extract_state    # noqa: E402
 from wam.global_planner import plan_path                      # noqa: E402
 from wam.moving_obstacle import MovingObstacle, inject_moving_obstacle  # noqa: E402
+from wam.obstacle_tracker import DynamicObstacleTracker, build_static_reference_points  # noqa: E402
 
 
 def main():
@@ -83,6 +84,13 @@ def main():
                               "actually keeping the robot away from the moving obstacle, "
                               "same before/after discipline Stage 3 used for the static one.")
     parser.add_argument("--disable-global-planner", action="store_true")
+    parser.add_argument("--disable-extrapolation", action="store_true",
+                         help="Stage 9's velocity-extrapolated prediction of the moving "
+                              "obstacle's future position, off -- falls back to Stage 8's "
+                              "behavior of treating its last-sensed position as frozen for "
+                              "the whole rollout horizon. Isolates whether extrapolation "
+                              "itself helps, same before/after discipline as "
+                              "--disable-obstacle-cost.")
     parser.add_argument("--robot-radius", type=float, default=0.35)
     parser.add_argument("--lidar-beams", type=int, default=180)
     parser.add_argument("--lidar-every", type=int, default=10, help="control ticks between lidar scans")
@@ -124,8 +132,17 @@ def main():
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="wam_moving_obstacle_"))
     xml_path = build_env_xml(world.walls, tmp_dir)
-    xml_text = inject_moving_obstacle(xml_path.read_text(), obstacle)
+    static_xml_text = xml_path.read_text()
+    xml_text = inject_moving_obstacle(static_xml_text, obstacle)
     xml_path.write_text(xml_text)
+
+    tracker = None
+    if not args.disable_obstacle_cost and not args.disable_extrapolation:
+        static_model = mj.MjModel.from_xml_string(static_xml_text)
+        static_data = mj.MjData(static_model)
+        mj.mj_forward(static_model, static_data)
+        static_points = build_static_reference_points(static_model, static_data, world)
+        tracker = DynamicObstacleTracker(static_points, match_radius=0.25)
 
     env = MPCResidualEnv(
         xml_path=str(xml_path), episode_seconds=args.seconds,
@@ -187,6 +204,7 @@ def main():
     map_frames = []
     robot_frames = []
     last_waypoints = None
+    last_dynamic_estimate = None
 
     for step in range(1, max_steps + 1):
         t_now = step / 200.0
@@ -203,8 +221,22 @@ def main():
         elif (step - 1) % (args.replan_every * 10) == 0:
             info_for_state = {"base_height": float(env.mujoco_go2.data.qpos[2])}
             state = extract_state(obs, info_for_state)
-            obstacle_pts = (None if args.disable_obstacle_cost
-                             else grid.occupied_points(threshold=args.occ_threshold))
+            all_occ_pts = (None if args.disable_obstacle_cost
+                            else grid.occupied_points(threshold=args.occ_threshold))
+            dynamic_obstacle = None
+            if all_occ_pts is None:
+                obstacle_pts = None
+            elif tracker is not None:
+                # Stage 9: static safety net (walls/island) stays frozen as before; the
+                # moving obstacle itself is pulled OUT of that frozen set and handed to the
+                # planner separately so it can be velocity-extrapolated per rollout step.
+                obstacle_pts = tracker.static_subset(all_occ_pts)
+                if last_dynamic_estimate is not None:
+                    dynamic_obstacle = last_dynamic_estimate
+            else:
+                # Stage 8's original behavior: every sensed point (including the moving
+                # obstacle's) frozen at its last-sensed position for the whole horizon.
+                obstacle_pts = all_occ_pts
 
             nav_goal = tuple(goal)
             last_waypoints = None
@@ -217,15 +249,19 @@ def main():
                     last_waypoints = waypoints
 
             result = planner.plan(state, (x, y, yaw), nav_goal, warm_start=target_action,
-                                   obstacle_points=obstacle_pts)
+                                   obstacle_points=obstacle_pts, dynamic_obstacle=dynamic_obstacle,
+                                   dynamic_obstacle_radius=args.obstacle_size)
             target_action = result.action.numpy()
             if args.verbose:
                 n_obs = 0 if obstacle_pts is None else len(obstacle_pts)
                 n_wp = 0 if last_waypoints is None else len(last_waypoints)
+                dyn_str = "none" if dynamic_obstacle is None else (
+                    f"pos=({dynamic_obstacle[0][0]:+.2f},{dynamic_obstacle[0][1]:+.2f}) "
+                    f"vel=({dynamic_obstacle[1][0]:+.2f},{dynamic_obstacle[1][1]:+.2f})")
                 print(f"  t={t_now:5.1f}s pos=({x:+.2f},{y:+.2f}) yaw={yaw:+.2f} "
                       f"dist={dist:.2f} obstacle=({obs_x:+.2f},{obs_y:+.2f}) "
                       f"n_waypoints={n_wp} action={target_action} n_obs={n_obs} "
-                      f"cost={result.cost:.2f}")
+                      f"dynamic={dyn_str} cost={result.cost:.2f}")
 
         cur_fwd += np.clip(target_action[0] - cur_fwd, -max_cmd_delta, max_cmd_delta)
         cur_lat += np.clip(target_action[1] - cur_lat, -max_cmd_delta, max_cmd_delta)
@@ -243,6 +279,9 @@ def main():
                 env.mujoco_go2.model, env.mujoco_go2.data, (x, y), yaw, n_beams=args.lidar_beams)
             grid.update((x, y, yaw), ranges, hit, angles)
             n_lidar_scans += 1
+            if tracker is not None:
+                last_dynamic_estimate = tracker.update(
+                    grid.occupied_points(threshold=args.occ_threshold), t_now)
             if args.record_map and n_lidar_scans % args.map_render_every == 0:
                 path_points = (np.array(last_waypoints) if last_waypoints is not None
                                else None)

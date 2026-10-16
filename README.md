@@ -66,6 +66,8 @@ an existing one.
    negative/harmful results; investigation closed, see below).
 8. **A moving obstacle** -- DONE (needed retuning for reaction speed, not cost weights;
    real load-bearing result once tuned, see below).
+9. **Velocity-extrapolated obstacle prediction** -- DONE (first attempt regressed safety;
+   diagnosed and fixed a footprint-radius gap, then a real if narrow improvement; see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -608,6 +610,82 @@ own motion, it only ever reacts to where lidar last sensed it, so closing the se
 faster mattered more than penalizing proximity harder. A real, load-bearing result (4/8 ->
 8/8, with safer margins too), not a trivial extension.
 
+### Stage 9: velocity-extrapolated obstacle prediction -- a real (if narrow) improvement, after fixing a self-inflicted regression
+
+Stage 8's planner treats the moving obstacle as frozen at its last-sensed position for the
+whole 0.5s rollout horizon -- a known, documented limitation. This stage gives the CEM
+rollout a predicted FUTURE obstacle position instead, extrapolated from an estimated
+velocity, re-evaluated at each rollout step's own future time rather than staying fixed.
+
+**Still obeys the sense-then-plan rule**: `wam/obstacle_tracker.py`'s `DynamicObstacleTracker`
+only ever looks at `OccupancyGrid.occupied_points()` -- it never imports or reads
+`MovingObstacle`'s ground-truth position or its analytic motion model. The one new prior it
+uses is a STATIC-only reference occupancy grid, built once at startup by lidar-scanning the
+environment's known wall/island geometry from a grid of vantage points with no obstacle
+present -- a reasonable "given a floor plan" assumption, not the same thing as knowing the
+obstacle's own position or motion. Any live occupied point far enough from that static
+reference is classified as a sighting of the moving obstacle; its centroid over successive
+scans gives a position, and a (windowed, not consecutive-scan) finite difference gives a
+velocity estimate. `wam/planner.py`'s `CEMPlanner.plan()` gained a `dynamic_obstacle=(pos,
+vel)` argument that extrapolates this point forward per rollout step, on top of the existing
+(now static-only) `obstacle_points` safety net.
+
+**First attempt was a regression, not an improvement**: at the project's standard 8-phase/seed
+protocol it was a wash (8/8 both ways, extrapolation actually slightly worse: 0.80m vs 0.85m
+mean min-distance). Worse, a repeated-trial stress test at one scenario (seed=1, phase=0.5,
+chosen because it happened to need a close pass) showed a REAL regression: 3/5 falls with
+extrapolation on vs. 0/5 with it off, reproduced again after widening the velocity-estimation
+window (ruled out noisy single-scan velocity estimates as the cause).
+
+**Root cause, diagnosed not guessed**: `OccupancyGrid`'s imperfect/slow free-space clearing
+means Stage 8's frozen `obstacle_points` set is actually a small CLUSTER of recently-occupied
+cells spanning the obstacle's last few positions, not a literal single point -- it gets a
+"free" safety margin from sensing lag that approximates the real object's physical width.
+Collapsing sensed points down to a bare centroid and extrapolating that single point forward
+threw this away, shrinking the avoided region from the real ~0.6m-wide obstacle down to a
+zero-radius point. **Fix**: pass the obstacle's own known physical footprint radius
+(`--obstacle-size`, already a CLI parameter, not new information) into the dynamic term's
+safety/collision margins (`dynamic_obstacle_radius` in `CEMPlanner.plan()`) -- restoring an
+explicit footprint instead of relying on accidental sensing-lag slack.
+
+**Multi-seed/phase verification after the fix** (same 8-phase/seed protocol as Stage 8's own
+table, `eval_obstacle_extrapolation.py`):
+
+| condition | success | fell | mean min-distance | worst-case min-distance | mean time-to-reach |
+|---|---|---|---|---|---|
+| frozen at last-sensed position (Stage 8) | 8/8 | 0 | 0.84m | 0.57m | 8.05s |
+| velocity-extrapolated (Stage 9) | 8/8 | **0** | **0.95m** | **0.73m** | **7.54s** |
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 eval_obstacle_extrapolation.py \
+    --trials 8 --seconds 25 --base-seed 300
+```
+
+Every metric favors extrapolation once the footprint-radius fix was in place -- safer margins
+(both mean and worst-case), and slightly faster, not a trade-off between them. Re-verified the
+original stress scenario directly (seed=1, phase=0.5, the one that used to fail): 5/5 success
+post-fix, plus a spot-check across 4 more seeds at the same stress phase, all clear
+(0.80-0.87m min-distance).
+
+<p align="center">
+  <img src="media/navigate_wam_extrapolation_robot.gif" width="340" alt="The real Go2 navigating the same stress scenario that used to fail before the footprint-radius fix">
+  <img src="media/navigate_wam_extrapolation_map.gif" width="480" alt="Overhead view of the same run: occupancy grid, true path, goal and the moving obstacle's current position annotated">
+</p>
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 navigate_wam_moving_obstacle.py \
+    --seed 1 --obstacle-phase 0.5 --seconds 25 \
+    --record-robot media/navigate_wam_extrapolation_robot.gif \
+    --record-map media/navigate_wam_extrapolation_map.gif
+```
+
+**Honest conclusion**: a reasonable-sounding idea (predict where it's GOING, not just where it
+WAS) made things measurably worse on the first attempt, for a mechanistic reason that was
+diagnosed and fixed rather than tuned away -- once the obstacle's own footprint was restored
+to the extrapolated term, the idea delivers a real, if narrow, improvement in both safety
+margin and speed over Stage 8's frozen assumption. `--disable-extrapolation` keeps Stage 8's
+original frozen behavior available for comparison; extrapolation is the new default.
+
 ## Repository layout
 
 ```
@@ -621,7 +699,8 @@ wam/
 │   ├── global_planner.py    # Stage 3b: A* over the occupancy grid, feeds CEM a waypoint
 │   ├── chunked_model.py       # Stage 6: history-conditioned, action-chunked transformer
 │   ├── chunked_planner.py      # Stage 6: CEM planner shooting through the chunked model
-│   └── moving_obstacle.py       # Stage 8: mocap-body moving obstacle, injected into the XML
+│   ├── moving_obstacle.py       # Stage 8: mocap-body moving obstacle, injected into the XML
+│   └── obstacle_tracker.py       # Stage 9: dynamic-vs-static point classification + velocity tracking
 ├── collect_data.py      # Stage 1: generate rollouts from the real Go2 + classical MPC
 ├── train_world_model.py   # Stage 1: one-step + H-step rollout loss training
 ├── train_chunked_world_model.py  # Stage 6: trains chunked_model.py on the same data
@@ -637,6 +716,7 @@ wam/
 ├── eval_pose_integration.py          # Stage 7: isolates integration-scheme vs. model error
 ├── navigate_wam_moving_obstacle.py      # Stage 8: obstacle-aware planning vs. a moving obstacle
 ├── eval_moving_obstacle.py                # Stage 8: multi-seed/phase obstacle-cost on/off comparison
+├── eval_obstacle_extrapolation.py           # Stage 9: multi-seed/phase frozen-vs-extrapolated comparison
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── checkpoints/world_model.pt   # Stage 1-3's checkpoint (flat-ground data only)
@@ -649,6 +729,7 @@ wam/
 ├── media/navigate_wam_astar_*.gif        # Stage 3b's corner-stall-fixed demos
 ├── media/navigate_wam_chunked_robot.gif  # Stage 6's chunked-model planner demo
 ├── media/navigate_wam_moving_*.gif         # Stage 8's moving-obstacle robot + map demos
+├── media/navigate_wam_extrapolation_*.gif    # Stage 9's velocity-extrapolation robot + map demos
 ├── requirements.txt
 └── README.md
 ```

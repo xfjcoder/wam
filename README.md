@@ -451,6 +451,16 @@ practice); and the chunked planner's `plan()` call is **~13x slower** despite ne
 only 1 batched model call per horizon instead of 10 -- the transformer's per-call cost
 dominates over the savings from fewer calls, at least at this model size and `n_samples`.
 
+<p align="center">
+  <img src="media/navigate_wam_chunked_robot.gif" width="480" alt="The real Go2, driven by the chunked world model's CEM planner, walking from the start (green marker, under the robot) to the goal (red marker) -- goal-directed, not a random walk, though no visible path/trail is drawn since the planner replans a straight shooting horizon each macro-step rather than following a precomputed path">
+</p>
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 navigate_wam_chunked.py \
+    --goal-x 3.0 --goal-y 1.0 --seed 200 \
+    --checkpoint checkpoints/world_model_chunked_large.pt --record media/navigate_wam_chunked_robot.gif
+```
+
 **Honest conclusion**: a genuinely better predictive model (clearly verified, 6/6 seeds)
 did not produce a better planner, and cost real planning speed -- the same "model
 accuracy isn't the bottleneck" lesson Stage 4/5 already found with the terrain-trained
@@ -497,6 +507,7 @@ wam/
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo
 ├── media/navigate_wam_obstacles_*.gif  # Stage 3's before/after + occupancy-map demos
 ├── media/navigate_wam_astar_*.gif        # Stage 3b's corner-stall-fixed demos
+├── media/navigate_wam_chunked_robot.gif  # Stage 6's chunked-model planner demo
 ├── requirements.txt
 └── README.md
 ```

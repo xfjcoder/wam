@@ -115,6 +115,16 @@ def main():
     pending_macro_state = history.states[-1].numpy()
     pending_macro_action = target_action.copy()
 
+    def _add_marker(scene, pos_xy, rgba, size=0.08):
+        if scene.ngeom >= scene.maxgeom:
+            return
+        g = scene.geoms[scene.ngeom]
+        mj.mjv_initGeom(
+            g, mj.mjtGeom.mjGEOM_SPHERE, np.array([size, 0, 0]),
+            np.array([pos_xy[0], pos_xy[1], 0.05]), np.eye(3).flatten(),
+            np.array(rgba, dtype=np.float32))
+        scene.ngeom += 1
+
     renderer = None
     if args.record:
         cam = mj.MjvCamera()
@@ -124,6 +134,9 @@ def main():
         cam.elevation = -70
         cam.azimuth = 90
         renderer = mj.Renderer(env.mujoco_go2.model, height=480, width=640)
+        START_RGBA = (0.1, 0.9, 0.1, 1.0)
+        GOAL_RGBA = (0.9, 0.1, 0.1, 1.0)
+        WAYPOINT_RGBA = (0.9, 0.9, 0.1, 1.0)
 
     for step in range(1, max_steps + 1):
         dist = float(np.hypot(goal[0] - x, goal[1] - y))
@@ -169,6 +182,10 @@ def main():
         if args.record:
             if step % 8 == 0:
                 renderer.update_scene(env.mujoco_go2.data, camera=cam)
+                _add_marker(renderer.scene, (0.0, 0.0), START_RGBA)
+                for i, wp in enumerate(route):
+                    _add_marker(renderer.scene, wp,
+                                GOAL_RGBA if i == n_wp - 1 else WAYPOINT_RGBA)
                 frames.append(renderer.render().copy())
         else:
             time.sleep(0.005)

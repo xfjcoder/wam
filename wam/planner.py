@@ -32,6 +32,16 @@ horizon. Distance is taken to the NEAREST of the extrapolated obstacles at each 
 same `cdist` + `amin` reduction the static term already uses, so multiple obstacles don't
 double-count a penalty for being near just one of them.
 
+Stage 11 adds an optional smoothness/hysteresis term: `w_smooth` penalizes a candidate
+command for differing from the PREVIOUS plan()'s chosen action (`warm_start`), independent
+of warm_start's existing role of just centering the first iteration's sampling distribution.
+Without this, nothing in the cost function penalizes switching commands. This was tried as a
+fix for the indecisive-lingering behavior Stage 10 observed with two dynamic obstacles, but
+repeated multi-seed evals found no reliable net benefit (it fixed some seeds' dithering while
+making others worse, noise-level in aggregate) and too high a weight (5.0) caused an actual
+timeout by over-committing to a bad action -- see README Stage 11 for the full measured
+result. Kept available (default 0.0, a no-op) as verified infrastructure, not adopted.
+
 Needs torch (see repo's own venv note in requirements.txt).
 """
 from dataclasses import dataclass
@@ -63,7 +73,8 @@ class CEMPlanner:
                  n_samples: int = 200, n_elites: int = 20, n_iters: int = 3,
                  w_dist: float = 1.0, w_heading: float = 0.3, w_stability: float = 3.0,
                  w_obstacle: float = 40.0, w_collision: float = 200.0,
-                 safety_margin: float = 0.5, collision_margin: float = 0.35):
+                 safety_margin: float = 0.5, collision_margin: float = 0.35,
+                 w_smooth: float = 0.0):
         self.model = model
         self.lo = torch.tensor([speed_range[0], lateral_range[0], yaw_rate_range[0]])
         self.hi = torch.tensor([speed_range[1], lateral_range[1], yaw_rate_range[1]])
@@ -79,6 +90,7 @@ class CEMPlanner:
         self.w_collision = w_collision
         self.safety_margin = safety_margin
         self.collision_margin = collision_margin
+        self.w_smooth = w_smooth
         # Stability penalty is measured relative to the TRAINING distribution's own typical
         # standing state, not a hand-picked constant -- ties the penalty to what the model
         # actually learned from rather than a guessed nominal height/roll/pitch.
@@ -121,8 +133,9 @@ class CEMPlanner:
             dyn_vel = torch.as_tensor(
                 [d[1] for d in dynamic_obstacles], dtype=torch.float32)  # (n_dyn, 2)
 
-        mean = (torch.as_tensor(warm_start, dtype=torch.float32) if warm_start is not None
-                else torch.zeros(3))
+        prev_action = (torch.as_tensor(warm_start, dtype=torch.float32)
+                       if warm_start is not None else None)
+        mean = prev_action if prev_action is not None else torch.zeros(3)
         std = (self.hi - self.lo) / 4.0
 
         best_cost, best_xy = float("inf"), (x0.item(), y0.item())
@@ -168,6 +181,9 @@ class CEMPlanner:
             heading_err = torch.atan2(gy - y_b, gx - x_b) - yaw_b
             heading_err = (heading_err + torch.pi) % (2 * torch.pi) - torch.pi
             cost = cost + self.w_dist * dist + self.w_heading * heading_err ** 2
+
+            if prev_action is not None and self.w_smooth > 0:
+                cost = cost + self.w_smooth * ((samples - prev_action) ** 2).sum(dim=1)
 
             elite_idx = torch.topk(-cost, self.n_elites).indices
             elites = samples[elite_idx]

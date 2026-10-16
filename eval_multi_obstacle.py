@@ -25,7 +25,7 @@ TIMEOUT_RE = re.compile(r"Did NOT reach the goal .* \(final distance ([\d.]+) m,
                          r"min distance to moving obstacles ([\d.]+) m\)")
 
 
-def run_one(seed, phase, seconds, mode):
+def run_one(seed, phase, seconds, mode, w_smooth=None):
     cmd = ["/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3",
            str(Path(__file__).resolve().parent / "navigate_wam_multi_obstacle.py"),
            "--seed", str(seed), "--obstacle1-phase", str(phase),
@@ -34,6 +34,8 @@ def run_one(seed, phase, seconds, mode):
         cmd.append("--disable-obstacle-cost")
     elif mode == "frozen":
         cmd.append("--disable-extrapolation")
+    if w_smooth is not None:
+        cmd += ["--w-smooth", str(w_smooth)]
     out = subprocess.run(cmd, capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent))
     text = out.stdout + out.stderr
     m = REACHED_RE.search(text)

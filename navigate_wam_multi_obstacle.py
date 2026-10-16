@@ -72,6 +72,14 @@ def main():
     parser.add_argument("--n-iters", type=int, default=3)
     parser.add_argument("--w-obstacle", type=float, default=40.0)
     parser.add_argument("--w-collision", type=float, default=200.0)
+    parser.add_argument("--w-smooth", type=float, default=0.0,
+                         help="Stage 11's command-smoothness/hysteresis penalty -- penalizes "
+                              "a candidate command for differing from the PREVIOUS plan()'s "
+                              "chosen action. Investigated as a fix for indecisive lingering "
+                              "observed with two dynamic obstacles, but repeated multi-seed "
+                              "evals found no reliable net benefit (noise-level either way) "
+                              "and a too-high weight (5.0) caused an actual timeout -- kept "
+                              "available but OFF by default; see README Stage 11.")
     parser.add_argument("--safety-margin", type=float, default=0.6)
     parser.add_argument("--collision-margin", type=float, default=0.35)
     parser.add_argument("--disable-obstacle-cost", action="store_true")
@@ -173,7 +181,8 @@ def main():
         horizon_steps=args.horizon_steps, macro_dt=10 / 200.0,
         n_samples=args.n_samples, n_elites=args.n_elites, n_iters=args.n_iters,
         w_obstacle=args.w_obstacle, w_collision=args.w_collision,
-        safety_margin=args.safety_margin, collision_margin=args.collision_margin)
+        safety_margin=args.safety_margin, collision_margin=args.collision_margin,
+        w_smooth=args.w_smooth)
 
     grid = OccupancyGrid(world.bounds, resolution=0.1)
     goal = np.array([args.goal_x, args.goal_y])

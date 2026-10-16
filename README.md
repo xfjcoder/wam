@@ -71,6 +71,8 @@ an existing one.
 10. **TWO independently-moving obstacles** -- DONE (architecture generalizes safely; found
     and fixed two real tracker bugs; Stage 9's extrapolation win doesn't clearly repeat, a
     genuine wash; see below).
+11. **Fix Stage 10's indecisive-lingering mechanism directly** -- DONE (hysteresis/smoothness
+    term implemented, tuned, measured twice -- inconclusive, closed; see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -755,6 +757,55 @@ indecisively near a wall rather than commit to a clean detour (one seed took 17.
 frozen) -- a cost not visible with only one tracked obstacle. Kept as the default regardless,
 since it's never worse at the thing that matters most (zero falls, comparable margins), but
 this is reported as a genuine mixed result, not rounded up to a second clean win.
+
+### Stage 11: tried fixing the indecisive-lingering mechanism directly -- no reliable net benefit, closed
+
+Stage 10's lingering was a real, traced symptom: the chosen command flip-flopping (lateral
+sign reversing repeatedly) without a real change in the situation. The natural fix is
+hysteresis -- penalize a candidate command for differing from the PREVIOUS command, so CEM
+needs a genuine cost improvement, not just this iteration's noise, before abandoning what it
+already committed to.
+
+`CEMPlanner.plan()` gained `w_smooth`: a cost term `w_smooth * ||candidate - previous_action||^2`
+added once per CEM iteration (not per rollout step -- it's about the candidate command itself,
+not a per-timestep state), using the previous `plan()` call's own chosen action as the
+reference point (kept separate from `warm_start`'s OTHER role of centering the sampling
+distribution, which gets overwritten each iteration as CEM refits around its elites).
+
+**Tuning attempt 1 (`w_smooth=5.0`) actively backfired**: seed 301 (previously the clearest
+case of lingering) TIMED OUT entirely within 30s -- over-committing to a single action for too
+long is its own failure mode, not just a milder version of dithering.
+
+**Tuning attempt 2 (`w_smooth=0.3`, a much gentler nudge), tested twice with the same 8-phase
+protocol to separate a real effect from Stage 2's own documented CEM sampling noise**:
+
+| run | condition | mean min-distance | worst-case min-distance | mean time-to-reach |
+|---|---|---|---|---|
+| 1 | w_smooth=0 (Stage 10 baseline) | 0.79m | 0.57m | 11.74s |
+| 1 | w_smooth=0.3 | 0.81m | **0.68m** | **11.11s** |
+| 2 | w_smooth=0 (Stage 10 baseline) | 0.79m | **0.62m** | **11.34s** |
+| 2 | w_smooth=0.3 | 0.80m | 0.53m | 11.51s |
+
+```bash
+# same eval_multi_obstacle.py machinery, run_one()'s new w_smooth passthrough
+```
+
+Run 1 favored smoothing on every metric; run 2 favored the Stage 10 baseline on two of
+three. Which SPECIFIC seed exhibited lingering also moved between runs (seed 301 was the
+slow one in run 1's baseline, already fine without any smoothing in run 2's baseline) --
+consistent with this project's already-documented unseeded-CEM noise, not a repeatable
+property of either configuration.
+
+**Honest conclusion, closed**: the hysteresis idea is mechanistically sound and the lingering
+symptom it targets is real, but at a weight gentle enough not to risk Attempt 1's timeout
+failure, its effect doesn't rise above this project's own CEM-sampling noise floor across
+repeated multi-seed evals -- no reliable net benefit either way. Same closure pattern as
+Stage 7's dead-reckoning investigation: a reasonable, directly-targeted fix attempt, measured
+twice, came back inconclusive rather than negative or positive. `w_smooth` defaults to 0.0 (a
+no-op, Stage 10's exact behavior) and is kept as verified, available infrastructure for a
+future attempt with a genuinely different idea (e.g. hysteresis on the global planner's
+WAYPOINT choice instead of the raw command, which the `--verbose` traces suggest may be the
+more direct source of the flip-flopping) rather than re-tuning this same weight further.
 
 ## Repository layout
 

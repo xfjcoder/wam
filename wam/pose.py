@@ -21,7 +21,11 @@ import torch
 
 def integrate_pose(x, y, yaw, v_fwd, v_lat, yaw_rate, dt: float):
     """One Euler step of (x, y, yaw) given body-frame forward/lateral velocity and yaw-rate,
-    all same-shaped tensors (typically (n_samples,)). Returns the updated (x, y, yaw)."""
+    all same-shaped tensors (typically (n_samples,)). Returns the updated (x, y, yaw).
+
+    Freezes yaw at its START-of-step value for the whole dt, so it under/over-shoots whenever
+    yaw_rate is nonzero across the step -- see integrate_pose_exact for a closed-form fix to
+    exactly this error, and eval_pose_integration.py for how much it actually matters here."""
     cos_yaw = torch.cos(yaw)
     sin_yaw = torch.sin(yaw)
     dx = v_fwd * cos_yaw - v_lat * sin_yaw
@@ -30,6 +34,33 @@ def integrate_pose(x, y, yaw, v_fwd, v_lat, yaw_rate, dt: float):
     y_next = y + dy * dt
     yaw_next = wrap_to_pi(yaw + yaw_rate * dt)
     return x_next, y_next, yaw_next
+
+
+def integrate_pose_exact(x, y, yaw, v_fwd, v_lat, yaw_rate, dt: float, eps: float = 1e-4):
+    """Closed-form unicycle-arc integration over one step: exact (not just first-order) for a
+    body-frame v_fwd/v_lat/yaw_rate held truly constant across the whole dt, since it accounts
+    for yaw continuously rotating during the step instead of freezing it at the start (what
+    integrate_pose does). Derived by integrating the body->world velocity rotation in closed
+    form: dx = integral_0^dt [v_fwd*cos(yaw+yaw_rate*s) - v_lat*sin(yaw+yaw_rate*s)] ds, etc.
+
+    Falls back to the ordinary Euler step when |yaw_rate * dt| is too small for the closed
+    form's division by yaw_rate to be numerically safe -- the two formulas agree in that limit
+    (no discontinuity at the switch)."""
+    small = (yaw_rate.abs() * dt) < eps
+    yaw_end = yaw + yaw_rate * dt
+    w_safe = torch.where(small, torch.ones_like(yaw_rate), yaw_rate)
+
+    sin_yaw, cos_yaw = torch.sin(yaw), torch.cos(yaw)
+    sin_end, cos_end = torch.sin(yaw_end), torch.cos(yaw_end)
+    dx_exact = (v_fwd / w_safe) * (sin_end - sin_yaw) + (v_lat / w_safe) * (cos_end - cos_yaw)
+    dy_exact = (v_fwd / w_safe) * (cos_yaw - cos_end) + (v_lat / w_safe) * (sin_end - sin_yaw)
+
+    dx_euler = v_fwd * cos_yaw * dt - v_lat * sin_yaw * dt
+    dy_euler = v_fwd * sin_yaw * dt + v_lat * cos_yaw * dt
+
+    x_next = x + torch.where(small, dx_euler, dx_exact)
+    y_next = y + torch.where(small, dy_euler, dy_exact)
+    return x_next, y_next, wrap_to_pi(yaw_end)
 
 
 def wrap_to_pi(angle):

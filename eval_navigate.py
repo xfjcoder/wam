@@ -45,12 +45,14 @@ def parse_result(stdout: str):
     return "unknown", None, None
 
 
-def run_trial(method: str, seed: int, goal, seconds: float, checkpoint: str):
+def run_trial(method: str, seed: int, goal, seconds: float, checkpoint: str, horizon_steps: int = None):
     gx, gy = goal
     if method == "wam":
         cmd = [str(PYTHON), str(WAM_DIR / "navigate_wam.py"),
                "--goal-x", str(gx), "--goal-y", str(gy), "--seed", str(seed),
                "--seconds", str(seconds), "--checkpoint", checkpoint]
+        if horizon_steps is not None:
+            cmd += ["--horizon-steps", str(horizon_steps)]
     elif method == "wam-chunked":
         cmd = [str(PYTHON), str(WAM_DIR / "navigate_wam_chunked.py"),
                "--goal-x", str(gx), "--goal-y", str(gy), "--seed", str(seed),
@@ -84,6 +86,9 @@ def main():
     ap.add_argument("--max-dist", type=float, default=3.0)
     ap.add_argument("--checkpoint", type=str, default="checkpoints/world_model.pt")
     ap.add_argument("--methods", nargs="+", default=["wam", "mpc-strafe", "mpc-turn"])
+    ap.add_argument("--horizon-steps", type=int, default=None,
+                     help="passthrough to navigate_wam.py's --horizon-steps (wam method only); "
+                          "default None leaves navigate_wam.py's own default (10) unchanged")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.goal_seed)
@@ -100,7 +105,7 @@ def main():
         print(f"=== {method} ===")
         for seed, goal in trials:
             status, t_reach, final_dist, wall = run_trial(
-                method, seed, goal, args.seconds, args.checkpoint)
+                method, seed, goal, args.seconds, args.checkpoint, args.horizon_steps)
             results[method].append((status, t_reach, final_dist))
             print(f"  seed={seed:4d} goal=({goal[0]:+.2f},{goal[1]:+.2f}): "
                   f"{status:8s} t={t_reach if t_reach is not None else float('nan'):5.1f}s "

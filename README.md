@@ -62,6 +62,8 @@ an existing one.
    teleport/terrain-height bug along the way; honest bounded result, see below).
 6. **A history-conditioned, action-chunked world model** -- DONE (clear rollout-accuracy
    win once scaled up; no downstream navigation win, and slower planning; see below).
+7. **Tackle the planner's dead-reckoning error directly** -- DONE (two well-measured,
+   negative/harmful results; investigation closed, see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -472,6 +474,77 @@ verified infrastructure (not deleted), not adopted as the default checkpoint/pla
     --goal-x 3.0 --goal-y 1.0 --checkpoint checkpoints/world_model_chunked_large.pt
 ```
 
+### Stage 7: tackled the planner's dead-reckoning error directly -- two negative results, closed
+
+`wam/pose.py`'s `integrate_pose` is only ever evaluated inside a CEM rollout, 10 macro-steps
+(0.5s) deep per candidate, using the model's own autoregressively-predicted velocities --
+Stage 3's corner-stall writeup flagged "small pose-integration error" as a plausible
+contributor to the planner's limitations without ever isolating it. User asked to tackle this
+directly rather than keep treating it as a vague caveat.
+
+**Experiment 1 -- is the Euler integration SCHEME itself the problem?** Added
+`integrate_pose_exact`, a closed-form unicycle-arc integration (accounts for yaw continuously
+rotating across the 50ms step, instead of freezing it at the step's start like forward-Euler
+does) and built `eval_pose_integration.py`: using 200 real held-out hold-blocks (6 seeds) --
+each one a natural, already-labeled instance of exactly what the planner tries to predict
+(0.5s under one constant command) -- it compares four horizon-matched final-position
+estimates against real ground truth:
+
+| estimate | mean error |
+|---|---|
+| integration-only, Euler, given REAL velocities | 0.0141m |
+| integration-only, exact-arc, given REAL velocities | 0.0140m |
+| full rollout (model-predicted velocities), Euler [current] | 0.1178m |
+| full rollout (model-predicted velocities), exact-arc | 0.1180m |
+
+**Finding: the integration scheme contributes almost nothing** (0.014m either way, a 1mm
+difference -- noise). The real error, ~8x larger, is the world model's own compounding
+autoregressive prediction error over the 10-step rollout; swapping in exact-arc integration
+doesn't help there either (95/200 blocks better, 105/200 worse, mean delta -0.0002m). Ruled
+out cleanly, not assumed.
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 eval_pose_integration.py \
+    --checkpoint checkpoints/world_model.pt --seeds 6
+```
+
+**Experiment 2 -- does shortening the horizon (less model-compounding error per rollout)
+help downstream?** `navigate_wam.py` already exposes `--horizon-steps` (default 10 = 0.5s)
+independently of `--replan-every` (5 macro-steps = 0.25s) -- the CEM commits to a full 0.5s
+of imagined rollout even though only half that time elapses before the next real-state
+correction. Shortening `horizon_steps` to 5 (matching the replan cadence exactly) should, by
+Experiment 1's own measurement, roughly halve the model-compounding error each rollout
+accumulates. Tested on the same 10-seed/goal protocol Stage 2/6 already use:
+
+| horizon_steps | success | mean time-to-reach | mean final distance |
+|---|---|---|---|
+| 10 (current default) | 10/10 | 3.29s | 0.049m |
+| 5 (matches replan cadence) | **9/10 (1 fall)** | 3.38s | **0.175m** |
+
+**It backfired.** Shortening the horizon made things measurably worse, not better -- one
+real fall (none before), final-distance precision nearly 4x worse, time-to-goal essentially
+unchanged. Most likely explanation: CEM needs enough lookahead for a candidate command's
+effect (through inertia/turning) to meaningfully separate it from its neighbors in the
+sampling distribution -- a shorter horizon starves the cost function of that separation, so
+it starts ranking candidates on noise rather than real differences, even though each
+individual rollout's own absolute position estimate is less eroded by compounding error.
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 eval_navigate.py \
+    --trials 10 --seconds 15 --base-seed 200 --goal-seed 7 --methods wam --horizon-steps 5
+```
+
+**Honest conclusion, investigation closed**: two concrete, well-measured attempts at
+"dead-reckoning error" as a fixable planner-mechanics issue came back negative -- one inert
+(integration formula), one actively harmful (shorter horizon). This is the same recurring
+theme as Stage 4/5/6: the planner's absolute internal position error isn't actually what
+limits downstream performance -- what matters more is the CEM having enough lookahead to
+rank candidates well. Treating this track as closed (same precedent as `go1_rl_walk`'s
+terrain-MPC investigation) rather than trying a third variant without a genuinely new idea.
+Kept `integrate_pose_exact` and `eval_pose_integration.py` as working, verified diagnostic
+infrastructure (not deleted); `horizon_steps`/`--horizon-steps` stay at their original
+default of 10.
+
 ## Repository layout
 
 ```
@@ -497,6 +570,7 @@ wam/
 ├── eval_obstacles.py                 # Stage 3b: multi-seed A*-enabled vs. disabled comparison
 ├── eval_terrain.py                     # Stage 4: multi-seed flat-vs-terrain model comparison
 ├── eval_obstacles_terrain.py             # Stage 5: multi-seed obstacles+terrain comparison
+├── eval_pose_integration.py          # Stage 7: isolates integration-scheme vs. model error
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── checkpoints/world_model.pt   # Stage 1-3's checkpoint (flat-ground data only)

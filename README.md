@@ -64,6 +64,8 @@ an existing one.
    win once scaled up; no downstream navigation win, and slower planning; see below).
 7. **Tackle the planner's dead-reckoning error directly** -- DONE (two well-measured,
    negative/harmful results; investigation closed, see below).
+8. **A moving obstacle** -- DONE (needed retuning for reaction speed, not cost weights;
+   real load-bearing result once tuned, see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -545,6 +547,67 @@ Kept `integrate_pose_exact` and `eval_pose_integration.py` as working, verified 
 infrastructure (not deleted); `horizon_steps`/`--horizon-steps` stay at their original
 default of 10.
 
+### Stage 8: a MOVING obstacle -- the sense-then-plan pipeline handles it, if tuned to react
+
+Every obstacle through Stage 3/3b/5 was static. This stage adds exactly one obstacle that
+moves, to stress-test the lidar -> occupancy-grid -> A*/CEM-obstacle-cost pipeline against
+something that isn't where the last scan saw it -- a genuinely different regime than "map it
+once, then plan around a fixed map."
+
+**Moving it at all needed a MuJoCo mechanism check first.** A plain `<geom>` under
+`<worldbody>` (what every static wall/island geom already is, via
+`demo_stage6_go2_world.py`'s `inject_walls`) is permanently welded to the world at compile
+time -- nothing can move it afterward. `wam/moving_obstacle.py`'s `MovingObstacle` instead
+injects a MuJoCo **mocap body** (no joint/inertia; its pose is written directly into
+`data.mocap_pos` every tick, not simulated), oscillating sinusoidally along one axis.
+Confirmed directly (not assumed) that `slam.mj_lidar.mj_lidar_scan`'s `mj_ray` call reads
+live geom transforms on every call (so the lidar sees the moved obstacle with zero changes
+needed there) and that `slam.occupancy_grid.OccupancyGrid.update` already does log-odds
+free-space clearing along each beam (so a cell the obstacle has moved away from decays back
+toward "free" over a few scans, rather than leaving a permanent ghost trail) -- both reused
+completely unmodified, same convention every earlier stage follows for `slam_sim` code.
+
+**Default scenario**: reuses `eval_obstacles.py`'s own "no obstacle (sanity check)" pair --
+(1.5, 1.5) &rarr; (1.5, 6.5), a straight line through open space with nothing static in the
+way -- and adds one obstacle centered on that line's midpoint, sweeping back and forth across
+it. What was a trivial, obstacle-free sanity check becomes a genuine dynamic-avoidance test:
+the line is clear most of the time, periodically blocked.
+
+<p align="center">
+  <img src="media/navigate_wam_moving_robot.gif" width="340" alt="The real Go2 routes around a moving red obstacle sweeping across its straight-line path to the blue goal marker">
+  <img src="media/navigate_wam_moving_map.gif" width="480" alt="Overhead view: the occupancy grid sensing the moving obstacle's current position and clearing its old one as it sweeps">
+</p>
+
+**First attempt at default settings (0.8m amplitude, 6s period, Stage 3's 0.25s replan
+cadence) was unsafe**: across 7 phase offsets, 3 ended in a real physical fall (the obstacle
+has real collision geometry, same `contype`/`conaffinity` as the walls -- a "fall" here means
+an actual collision, not just a bad cost). **Tuned three things, not the obstacle cost
+weights**: slowed the sweep (6s -> 10s period), replanned more often (`--replan-every` 5 ->
+2 macro-steps -- the replan CADENCE, not the rollout horizon Stage 7 already found shouldn't
+be shortened), and widened the safety margin slightly (0.5m -> 0.6m). Result: 7/7 across the
+same phases, all comfortably clear (worst-case min-distance 0.64m).
+
+**Multi-seed/phase verification that the obstacle cost is actually load-bearing against a
+moving obstacle, not just a static one** (8 phases spanning a full sweep cycle,
+`eval_moving_obstacle.py`):
+
+| condition | success | fell | mean min-distance to obstacle | worst-case min-distance |
+|---|---|---|---|---|
+| obstacle cost disabled (Stage 2 goal-only) | 4/8 | 4 | 0.74m | 0.49m |
+| obstacle cost enabled (Stage 8) | **8/8** | **0** | 0.82m | 0.60m |
+
+```bash
+/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 eval_moving_obstacle.py \
+    --trials 8 --seconds 25 --base-seed 300
+```
+
+**Honest conclusion**: the same sense-then-plan pipeline built for a static island generalizes
+to a moving obstacle, but only once retuned for reaction speed (faster replanning) rather than
+made more cautious in the cost function alone -- the planner has no model of the obstacle's
+own motion, it only ever reacts to where lidar last sensed it, so closing the sensing loop
+faster mattered more than penalizing proximity harder. A real, load-bearing result (4/8 ->
+8/8, with safer margins too), not a trivial extension.
+
 ## Repository layout
 
 ```
@@ -557,7 +620,8 @@ wam/
 │   ├── planner.py         # Stage 2/3: CEM shooting planner, optional obstacle cost
 │   ├── global_planner.py    # Stage 3b: A* over the occupancy grid, feeds CEM a waypoint
 │   ├── chunked_model.py       # Stage 6: history-conditioned, action-chunked transformer
-│   └── chunked_planner.py      # Stage 6: CEM planner shooting through the chunked model
+│   ├── chunked_planner.py      # Stage 6: CEM planner shooting through the chunked model
+│   └── moving_obstacle.py       # Stage 8: mocap-body moving obstacle, injected into the XML
 ├── collect_data.py      # Stage 1: generate rollouts from the real Go2 + classical MPC
 ├── train_world_model.py   # Stage 1: one-step + H-step rollout loss training
 ├── train_chunked_world_model.py  # Stage 6: trains chunked_model.py on the same data
@@ -571,6 +635,8 @@ wam/
 ├── eval_terrain.py                     # Stage 4: multi-seed flat-vs-terrain model comparison
 ├── eval_obstacles_terrain.py             # Stage 5: multi-seed obstacles+terrain comparison
 ├── eval_pose_integration.py          # Stage 7: isolates integration-scheme vs. model error
+├── navigate_wam_moving_obstacle.py      # Stage 8: obstacle-aware planning vs. a moving obstacle
+├── eval_moving_obstacle.py                # Stage 8: multi-seed/phase obstacle-cost on/off comparison
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── checkpoints/world_model.pt   # Stage 1-3's checkpoint (flat-ground data only)
@@ -582,6 +648,7 @@ wam/
 ├── media/navigate_wam_obstacles_*.gif  # Stage 3's before/after + occupancy-map demos
 ├── media/navigate_wam_astar_*.gif        # Stage 3b's corner-stall-fixed demos
 ├── media/navigate_wam_chunked_robot.gif  # Stage 6's chunked-model planner demo
+├── media/navigate_wam_moving_*.gif         # Stage 8's moving-obstacle robot + map demos
 ├── requirements.txt
 └── README.md
 ```

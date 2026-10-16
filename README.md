@@ -245,7 +245,7 @@ of walking a mostly-straight line, never "route around this obstacle" from scrat
 0.5s dead-reckoned horizon.
 
 <p align="center">
-  <img src="media/navigate_wam_astar_robot.gif" width="340" alt="With the A* global planner, the real Go2 smoothly rounds the island's sharp corner instead of stalling">
+  <img src="media/navigate_wam_astar_robot.gif" width="340" alt="With the A* global planner, the real Go2 smoothly rounds the island's sharp corner instead of stalling -- green=start, red=goal, yellow=intermediate A* waypoints">
   <img src="media/navigate_wam_astar_map.gif" width="340" alt="Overhead view: the A* waypoint path (blue dots) bending around the island corner, occupancy grid filling in from lidar">
 </p>
 

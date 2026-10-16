@@ -169,6 +169,16 @@ def main():
     reached, fell = False, False
     t_reached = None
 
+    def _add_marker(scene, pos_xy, rgba, size=0.15):
+        if scene.ngeom >= scene.maxgeom:
+            return
+        g = scene.geoms[scene.ngeom]
+        mj.mjv_initGeom(
+            g, mj.mjtGeom.mjGEOM_SPHERE, np.array([size, 0, 0]),
+            np.array([pos_xy[0], pos_xy[1], 0.05]), np.eye(3).flatten(),
+            np.array(rgba, dtype=np.float32))
+        scene.ngeom += 1
+
     robot_renderer, robot_cam = None, None
     if args.record_robot:
         robot_cam = mj.MjvCamera()
@@ -178,6 +188,9 @@ def main():
         robot_cam.elevation = -60
         robot_cam.azimuth = 90
         robot_renderer = mj.Renderer(env.mujoco_go2.model, height=480, width=640)
+        START_RGBA = (0.1, 0.9, 0.1, 1.0)
+        GOAL_RGBA = (0.9, 0.1, 0.1, 1.0)
+        WAYPOINT_RGBA = (0.9, 0.9, 0.1, 1.0)
 
     map_frames = []
     robot_frames = []
@@ -243,6 +256,11 @@ def main():
 
         if args.record_robot and step % 16 == 0:
             robot_renderer.update_scene(env.mujoco_go2.data, camera=robot_cam)
+            _add_marker(robot_renderer.scene, (args.start_x, args.start_y), START_RGBA)
+            _add_marker(robot_renderer.scene, goal, GOAL_RGBA)
+            if last_waypoints is not None:
+                for wp in last_waypoints[:-1]:
+                    _add_marker(robot_renderer.scene, wp, WAYPOINT_RGBA, size=0.12)
             robot_frames.append(robot_renderer.render().copy())
 
         if terminated or truncated:

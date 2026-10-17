@@ -76,13 +76,13 @@ an existing one.
 11. **Fix Stage 10's indecisive-lingering mechanism directly** -- DONE (hysteresis/smoothness
     term implemented, tuned, measured twice -- inconclusive, closed; see below).
 12. **Pixel-rendering mini-plan: onboard camera, a small dataset, an encoder sanity check,
-    a frozen-latent dynamics check, and a joint-training attempt** -- DONE (camera infra + a
-    real rendering bug found and fixed + a small autoencoder learns real structure + a
-    frozen-encoder latent dynamics model shows a weak one-step win but degrades fast under
-    rollout + joint training doesn't fix that rollout degradation either, closed; see below).
-    Honest, mixed-to-negative result throughout -- not a working pixel-conditioned world
-    model yet; the most specific remaining idea (H-step rollout loss during training, not
-    just one-step) is flagged but not attempted.
+    a frozen-latent dynamics check, a joint-training attempt, and an isolating experiment**
+    -- DONE (camera infra + a real rendering bug found and fixed + a small autoencoder
+    learns real structure + a frozen-encoder latent dynamics model shows a weak one-step win
+    but degrades fast under rollout + joint training doesn't fix that rollout degradation on
+    flat ground + the SAME method clearly works on a deliberately easy wall-approach scenario,
+    confirming the earlier failures were about signal strength/task difficulty, not a broken
+    method; see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -949,6 +949,44 @@ under its OWN compounding predictions. Not attempted here -- a bigger, separate 
 closed for now with the same "measured, found real negative, report honestly" discipline as
 Stage 7/11.
 
+### Step 8: isolating WHY -- a deliberately easy scenario shows the method does work, given a strong enough signal
+
+User asked directly: is steps 6/7's failure about the model, the settings, compute -- or
+something else? Diagnosis: not compute (training converged smoothly and quickly on CPU, no
+sign of being iteration-starved). The two real suspects were (a) the flat-ground dataset's
+only visual signal being a subtle, SUB-PIXEL shift in the floor's checker texture -- precisely
+predicting it means implicitly learning projective geometry, a genuinely hard regression
+target -- and (b) a small, single-scenario dataset for a problem that size. Rather than guess,
+built the simplest scenario that could tell them apart: a LARGE, obvious, directly
+action-correlated visual signal, to see if the exact same method/architecture/training script
+suddenly works.
+
+`collect_wall_approach_demo.py`: the robot drives straight at `slam_sim`'s `loop_corridor`
+island wall, then straight back, repeating -- a SCRIPTED forward-speed oscillation (not
+collect_data.py's random-command exploration). The dominant visual change becomes "the gray
+wall band grows and shrinks", confirmed visually before training anything (a 1-episode smoke
+test's frames show a clean thin-band -> near-full-frame -> thin-band cycle). Same per-
+transition recording format as `--record-pixels`, so `train_pixel_world_model.py` runs on it
+completely UNCHANGED -- only the data, not the method, changed. 10 train + 3 val episodes (one
+full 10s approach+retreat cycle each), 2000 train / 600 val transitions, no falls.
+
+| check | flat-ground dataset (step 7) | wall-approach dataset (step 8) |
+|---|---|---|
+| val one-step prediction MSE vs. trivial "predict no change" baseline | 0.00010 vs 0.00009 (does NOT beat it) | **0.00028 vs 0.00070 (clearly beats it, ~2.5x better)** |
+| 5-step autoregressive rollout, decoded every step | visually blurred by step 1, stays degraded | **tracks the real wall band growing across all 5 steps** -- some texture noise creeps in by later steps, but the core structure (band size/position) stays right throughout, a qualitatively different outcome from step 7's collapse-to-blur |
+
+**Honest conclusion**: this confirms the diagnosis rather than just restating it -- the exact
+same encoder/dynamics architecture, training script, and loss weights that failed on flat
+ground produces a real, visually-verified working one-step-trained latent dynamics model when
+given a strong, simple, action-correlated signal. Steps 6/7's failure was about task
+difficulty and signal strength for THAT dataset, not a fundamentally broken method. This is
+still a narrow result (one scripted scenario, one obstacle, oscillating along a single axis)
+-- it does not show the method generalizes to open-ended random-command exploration or richer
+scenes, and the earlier-flagged H-step rollout loss idea is still untried and would likely
+help here too (some of this rollout's texture noise by step 4-5 is plausibly exactly what
+that loss would suppress). But it answers the question actually asked: pixel-based latent
+dynamics prediction DOES work, given data where the signal is strong enough to learn from.
+
 ## Repository layout
 
 ```
@@ -990,15 +1028,18 @@ wam/
 ├── train_pixel_encoder.py                           # Stage 12: trains pixel_encoder.py's ConvAutoencoder
 ├── train_pixel_dynamics.py                            # Stage 12 step 6: trains pixel_dynamics.py on frozen latents
 ├── train_pixel_world_model.py                           # Stage 12 step 7: joint encoder+dynamics training
+├── collect_wall_approach_demo.py                          # Stage 12 step 8: scripted wall-approach/retreat dataset
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth
+├── data/rollouts_wall_demo.npz      # Stage 12 step 8: scripted wall-approach/retreat dataset
 ├── checkpoints/world_model.pt   # Stage 1-3's checkpoint (flat-ground data only)
 ├── checkpoints/world_model_terrain.pt  # Stage 4's checkpoint (terrain-inclusive data)
 ├── checkpoints/world_model_chunked_large.pt  # Stage 6's chunked-model checkpoint
 ├── checkpoints/pixel_encoder.pt         # Stage 12's ConvAutoencoder checkpoint
 ├── checkpoints/pixel_dynamics.pt         # Stage 12 step 6's LatentDynamics checkpoint
 ├── checkpoints/pixel_world_model.pt        # Stage 12 step 7's jointly-trained checkpoint
+├── checkpoints/pixel_world_model_wall_demo.pt # Stage 12 step 8's checkpoint (wall-approach data)
 ├── media/rollout_comparison.png  # Stage 1's verification plot
 ├── media/rollout_comparison_terrain.png  # Stage 4's verification plot (on terrain)
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo
@@ -1013,6 +1054,8 @@ wam/
 ├── media/pixel_dynamics_rollout.png                  # Stage 12 step 6's ground-truth-vs-rollout grid
 ├── media/pixel_world_model_reconstructions.png         # Stage 12 step 7's reconstruction grid
 ├── media/pixel_world_model_rollout.png                   # Stage 12 step 7's ground-truth-vs-rollout grid
+├── media/pixel_world_model_wall_demo_reconstructions.png   # Stage 12 step 8's reconstruction grid
+├── media/pixel_world_model_wall_demo_rollout.png             # Stage 12 step 8's ground-truth-vs-rollout grid
 ├── requirements.txt
 └── README.md
 ```

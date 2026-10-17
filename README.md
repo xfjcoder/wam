@@ -76,13 +76,17 @@ an existing one.
 11. **Fix Stage 10's indecisive-lingering mechanism directly** -- DONE (hysteresis/smoothness
     term implemented, tuned, measured twice -- inconclusive, closed; see below).
 12. **Pixel-rendering mini-plan: onboard camera, a small dataset, an encoder sanity check,
-    a frozen-latent dynamics check, a joint-training attempt, and an isolating experiment**
-    -- DONE (camera infra + a real rendering bug found and fixed + a small autoencoder
-    learns real structure + a frozen-encoder latent dynamics model shows a weak one-step win
-    but degrades fast under rollout + joint training doesn't fix that rollout degradation on
-    flat ground + the SAME method clearly works on a deliberately easy wall-approach scenario,
-    confirming the earlier failures were about signal strength/task difficulty, not a broken
-    method; see below).
+    a frozen-latent dynamics check, a joint-training attempt, an isolating experiment, and the
+    H-step rollout loss fix** -- DONE (camera infra + a real rendering bug found and fixed + a
+    small autoencoder learns real structure + a frozen-encoder latent dynamics model shows a
+    weak one-step win but degrades fast under rollout + joint training doesn't fix that
+    rollout degradation on flat ground + the SAME method clearly works on a deliberately easy
+    wall-approach scenario, confirming the earlier failures were about signal strength/task
+    difficulty, not a broken method + adding the H-step rollout loss (Stage 1's own fix for
+    the same failure mode) measurably improves multi-step rollout accuracy on BOTH datasets
+    and visibly cleans up compounding noise on the wall-approach data, but still can't
+    manufacture a visually coherent rollout from flat ground's inherently weak signal; see
+    below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -987,6 +991,46 @@ help here too (some of this rollout's texture noise by step 4-5 is plausibly exa
 that loss would suppress). But it answers the question actually asked: pixel-based latent
 dynamics prediction DOES work, given data where the signal is strong enough to learn from.
 
+### Step 9: the H-step rollout loss -- the fix works as designed, but doesn't rescue a weak-signal dataset
+
+Step 8 flagged this as untried; this step tries it. `train_world_model.py` (Stage 1) already
+established the fix for the state-based model: one-step loss alone looks fine while errors
+compound catastrophically under autoregressive rollout, fixed by an explicit H-step rollout
+loss (unroll the model H steps, penalize divergence at every step, not just step 1 --
+PETS/MBPO/Dreamer-style). `train_pixel_world_model.py` never had this -- steps 6/7/8 all
+trained on one-step prediction loss only. Added here: unroll `LatentDynamics` for
+`--rollout-train-horizon` steps (default 5) in LATENT space, decode at every step, and add
+the resulting pixel-space MSE (averaged over the horizon) to the existing recon+pred loss,
+backprop through all H repeated dynamics+decode applications (BPTT-style, same grad-clip
+guard Stage 1 already needed for the same reason). `wam/pixel_dynamics.py` gained
+`build_window_starts` (the frame-adjacency generalization of `consecutive_pairs` to horizon >
+1) to generate valid training/validation windows. Also added an honest multi-step trivial
+baseline ("predict no change for all H steps") alongside the existing one-step baseline, since
+a model could match the one-step baseline and still lose badly over H steps if its errors
+compound -- exactly the failure mode being targeted.
+
+Reran the exact same script (now with the H-step loss on by default, weight 1.0) on both
+existing datasets, nothing else changed:
+
+| check | flat-ground (step 7 -> step 9) | wall-approach (step 8 -> step 9) |
+|---|---|---|
+| val one-step prediction MSE vs. trivial baseline | 0.00010 vs 0.00009 (still does NOT beat it, unchanged) | 0.00039 vs 0.00070 (still beats it, but a smaller margin than step 8's 0.00028 -- **one-step accuracy traded off for multi-step stability**) |
+| val 5-step rollout MSE vs. trivial 5-step baseline (new metric, didn't exist before step 9) | **0.00016 vs 0.00025 (beats it, ~1.6x)** | **0.00041 vs 0.00158 (beats it, ~3.9x)** |
+| 5-step rollout grid, visually | still collapses to flat blur by step 1, same as step 7 -- no visible improvement despite the better MSE | band growth tracks correctly as before (step 8), AND the texture/speckle noise that crept in by steps 4-5 is visibly reduced/smoother than step 8's version |
+
+**Honest conclusion**: the fix works exactly as the model-based-RL literature says it should --
+it measurably improves multi-step rollout accuracy over a trivial baseline on BOTH datasets,
+and on the wall-approach data it visibly cleans up the compounding-noise artifact flagged in
+step 8, at a real cost to one-step accuracy (the expected trade-off: training now directly
+optimizes the metric that matters for planning instead of the easier one-step proxy). But on
+the flat-ground dataset, beating a (very small-magnitude) trivial baseline numerically did
+NOT translate into a visually coherent rollout -- it still collapses to blur. This refines
+(doesn't overturn) step 8's diagnosis: the H-step loss is a real, working fix for the
+"one-step-loss-hides-compounding-error" problem, but it cannot manufacture signal that isn't
+in the data. Flat ground's signal is still too weak (a sub-pixel checker-texture shift) for
+ANY training-objective fix alone to produce a usable rollout; a strong, large, directly
+action-correlated signal (step 8's wall band) remains the thing that actually mattered.
+
 ## Repository layout
 
 ```
@@ -1005,6 +1049,7 @@ wam/
 │   ├── camera.py                  # Stage 12: onboard RGB+depth camera injection + rendering
 │   ├── pixel_encoder.py            # Stage 12: small conv autoencoder for the RGB frames
 │   └── pixel_dynamics.py            # Stage 12 step 6: latent-space delta predictor (frozen encoder)
+│                                      # (Stage 12 step 9: + build_window_starts for H-step windows)
 ├── collect_data.py      # Stage 1: generate rollouts from the real Go2 + classical MPC
 │                            # (Stage 12: --record-pixels captures paired RGB+depth too)
 ├── train_world_model.py   # Stage 1: one-step + H-step rollout loss training
@@ -1028,6 +1073,7 @@ wam/
 ├── train_pixel_encoder.py                           # Stage 12: trains pixel_encoder.py's ConvAutoencoder
 ├── train_pixel_dynamics.py                            # Stage 12 step 6: trains pixel_dynamics.py on frozen latents
 ├── train_pixel_world_model.py                           # Stage 12 step 7: joint encoder+dynamics training
+│                                                             # (Stage 12 step 9: + H-step rollout loss)
 ├── collect_wall_approach_demo.py                          # Stage 12 step 8: scripted wall-approach/retreat dataset
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
@@ -1040,6 +1086,8 @@ wam/
 ├── checkpoints/pixel_dynamics.pt         # Stage 12 step 6's LatentDynamics checkpoint
 ├── checkpoints/pixel_world_model.pt        # Stage 12 step 7's jointly-trained checkpoint
 ├── checkpoints/pixel_world_model_wall_demo.pt # Stage 12 step 8's checkpoint (wall-approach data)
+├── checkpoints/pixel_world_model_hstep.pt       # Stage 12 step 9's checkpoint (flat-ground + H-step loss)
+├── checkpoints/pixel_world_model_wall_demo_hstep.pt # Stage 12 step 9's checkpoint (wall-approach + H-step loss)
 ├── media/rollout_comparison.png  # Stage 1's verification plot
 ├── media/rollout_comparison_terrain.png  # Stage 4's verification plot (on terrain)
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo
@@ -1056,6 +1104,10 @@ wam/
 ├── media/pixel_world_model_rollout.png                   # Stage 12 step 7's ground-truth-vs-rollout grid
 ├── media/pixel_world_model_wall_demo_reconstructions.png   # Stage 12 step 8's reconstruction grid
 ├── media/pixel_world_model_wall_demo_rollout.png             # Stage 12 step 8's ground-truth-vs-rollout grid
+├── media/pixel_world_model_hstep_reconstructions.png           # Stage 12 step 9's reconstruction grid (flat-ground)
+├── media/pixel_world_model_hstep_rollout.png                     # Stage 12 step 9's rollout grid (flat-ground)
+├── media/pixel_world_model_wall_demo_hstep_reconstructions.png     # Stage 12 step 9's reconstruction grid (wall-approach)
+├── media/pixel_world_model_wall_demo_hstep_rollout.png                # Stage 12 step 9's rollout grid (wall-approach)
 ├── requirements.txt
 └── README.md
 ```

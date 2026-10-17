@@ -13,13 +13,38 @@ import torch
 import torch.nn as nn
 
 
+def build_window_starts(episode_ids: np.ndarray, horizon: int) -> np.ndarray:
+    """Start indices `i` such that frames i, i+1, ..., i+horizon all belong to the same
+    episode -- i.e. an H-step pixel rollout from `i` (predicting frames i+1..i+horizon) never
+    needs a frame from a different episode.
+
+    NOTE this is a frame-ADJACENCY check, unlike train_world_model.py's build_window_starts
+    over STATE data: there, each transition already carries its own next_state, so a
+    horizon-H state rollout from `i` only needs actions/next_states at i..i+H-1 within the
+    segment (no requirement that row i+1 itself be "the next frame"). The pixel dataset has
+    no such per-row next_frame field -- frame[i+1] IS frame[i]'s next frame only because
+    collect_data.py / collect_wall_approach_demo.py capture one frame per transition,
+    back-to-back within an episode -- hence the stricter off-by-one here."""
+    starts = []
+    n = len(episode_ids)
+    i = 0
+    while i < n:
+        j = i
+        while j < n and episode_ids[j] == episode_ids[i]:
+            j += 1
+        last_valid_start = j - 1 - horizon
+        if last_valid_start >= i:
+            starts.extend(range(i, last_valid_start + 1))
+        i = j
+    return np.array(starts, dtype=np.int64)
+
+
 def consecutive_pairs(episode_ids: np.ndarray) -> np.ndarray:
     """Indices i such that (i, i+1) are consecutive transitions of the SAME episode --
     i.e. frame[i+1] really is frame[i]'s next frame, not some other episode's first frame.
-    (train_world_model.py's build_window_starts does the same thing for horizon-H windows;
-    this is the horizon=1 case, used by every pixel-dynamics training script.)"""
-    same_episode = episode_ids[:-1] == episode_ids[1:]
-    return np.nonzero(same_episode)[0]
+    The horizon=1 case of build_window_starts above, used by every pixel-dynamics training
+    script for its one-step loss."""
+    return build_window_starts(episode_ids, 1)
 
 
 class LatentDynamics(nn.Module):

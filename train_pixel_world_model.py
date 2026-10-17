@@ -25,6 +25,17 @@ weight-tuning.
 the encoder's latent distribution isn't fixed here like it was in step 6, so a one-time fit
 from a freshly-initialized (effectively random) encoder would be close to meaningless.
 
+Also adds the H-step rollout loss flagged (but not yet tried) since step 6: steps 6/7/8 only
+ever trained on ONE-STEP prediction loss, exactly the gap train_world_model.py's own docstring
+warns about for the state-based WorldModel -- one-step loss alone looked fine there too, but
+errors compounded catastrophically under the autoregressive rollout actually used at eval
+time, fixed by training on an explicit H-step rollout loss (PETS/MBPO/Dreamer-style), not
+one-step error alone. Same fix here: unroll `dynamics` for `--rollout-train-horizon` steps in
+LATENT space, decode at every step, and penalize divergence from the true frame at every one
+of those steps (see wam/pixel_dynamics.py's build_window_starts for the frame-adjacency
+windows this needs). Backprops through H repeated dynamics+decode applications (BPTT-style),
+same gradient-spike risk train_world_model.py already guards against with --grad-clip.
+
 Usage (needs go1_rl_walk/mpc's own venv for torch):
     /home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 train_pixel_world_model.py \
         --data data/rollouts_pixels.npz --checkpoint checkpoints/pixel_world_model.pt
@@ -38,8 +49,8 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from wam.pixel_encoder import ConvAutoencoder, to_tensor_01        # noqa: E402
-from wam.pixel_dynamics import LatentDynamics, consecutive_pairs  # noqa: E402
+from wam.pixel_encoder import ConvAutoencoder, to_tensor_01                           # noqa: E402
+from wam.pixel_dynamics import LatentDynamics, consecutive_pairs, build_window_starts  # noqa: E402
 
 
 def refit_normalization(encoder, dynamics, train_x, train_action, train_pairs):
@@ -64,6 +75,20 @@ def main():
     ap.add_argument("--w-pred", type=float, default=1.0)
     ap.add_argument("--refit-every", type=int, default=10,
                      help="epochs between LatentDynamics normalization-buffer refits")
+    ap.add_argument("--rollout-loss-weight", type=float, default=1.0,
+                     help="weight on the H-step pixel-space rollout loss, added on top of "
+                          "the one-step recon+pred losses above")
+    ap.add_argument("--rollout-train-horizon", type=int, default=5,
+                     help="steps unrolled autoregressively per rollout-loss batch, in LATENT "
+                          "space (decoded to pixels for the loss) -- same role as "
+                          "train_world_model.py's --rollout-horizon")
+    ap.add_argument("--rollout-batches-per-epoch", type=int, default=10)
+    ap.add_argument("--rollout-batch-size", type=int, default=16)
+    ap.add_argument("--grad-clip", type=float, default=1.0,
+                     help="max gradient norm, applied to both loss passes -- the H-step "
+                          "rollout loss backprops through H repeated dynamics+decode "
+                          "applications (BPTT-style), which can produce occasional much "
+                          "larger gradients than the one-step losses ever do")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--rollout-steps", type=int, default=5)
     ap.add_argument("--rollout-grid", type=str, default="media/pixel_world_model_rollout.png")
@@ -83,6 +108,12 @@ def main():
     print(f"train frames: {len(train_x)} ({len(train_pairs)} pairs), "
           f"val frames: {len(val_x)} ({len(val_pairs)} pairs)")
 
+    Htrain = args.rollout_train_horizon
+    train_window_starts = torch.from_numpy(build_window_starts(data["train_episode_ids"], Htrain))
+    val_window_starts = torch.from_numpy(build_window_starts(data["val_episode_ids"], Htrain))
+    print(f"Rollout-loss windows (horizon={Htrain}): {len(train_window_starts)} train, "
+          f"{len(val_window_starts)} val.")
+
     encoder = ConvAutoencoder(latent_dim=args.latent_dim, resolution=resolution)
     dynamics = LatentDynamics(latent_dim=args.latent_dim, action_dim=train_action.shape[1])
     params = list(encoder.parameters()) + list(dynamics.parameters())
@@ -93,6 +124,17 @@ def main():
     # the direct pixel-space analogue of step 6's latent-space zero-delta baseline.
     baseline_val_mse = loss_fn(val_x[val_pairs], val_x[val_pairs + 1]).item()
     print(f"trivial baseline (predict frame_t for frame_t+1) val MSE: {baseline_val_mse:.5f}")
+
+    # Multi-step analogue of the baseline above -- "predict no change for H steps" -- the
+    # honest comparison for the NEW rollout loss/metric below (a model that merely matches
+    # the one-step baseline could still lose badly to this over H steps if its errors
+    # compound, which is exactly the failure mode being targeted here).
+    with torch.no_grad():
+        baseline_roll = sum(
+            loss_fn(val_x[val_window_starts], val_x[val_window_starts + h + 1]).item()
+            for h in range(Htrain)) / Htrain
+    print(f"trivial {Htrain}-step rollout baseline (predict frame_t unchanged for all steps) "
+          f"val MSE: {baseline_roll:.5f}")
 
     refit_normalization(encoder, dynamics, train_x, train_action, train_pairs)
 
@@ -124,9 +166,31 @@ def main():
 
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
             opt.step()
             total_recon += recon_loss.item() * len(idx)
             total_pred += pred_loss.item() * len(idx)
+
+        # --- H-step rollout loss pass (penalizes autoregressive compounding directly, in
+        # PIXEL space) -- unroll in LATENT space for Htrain steps, decode at every step, and
+        # penalize divergence from the true frame at every one of those steps, not just step
+        # 1. This is the exact fix steps 6/7/8 never tried (see module docstring).
+        roll_loss_total = 0.0
+        for _ in range(args.rollout_batches_per_epoch):
+            idx = train_window_starts[torch.randint(0, len(train_window_starts),
+                                                      (args.rollout_batch_size,))]
+            z = encoder.encode(train_x[idx])
+            loss = 0.0
+            for h in range(Htrain):
+                z = dynamics(z, train_action[idx + h])
+                loss = loss + loss_fn(encoder.decode(z), train_x[idx + h + 1])
+            loss = (loss / Htrain) * args.rollout_loss_weight
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+            opt.step()
+            roll_loss_total += loss.item()
+        roll_loss_total /= args.rollout_batches_per_epoch
 
         if epoch % 10 == 0 or epoch == 1:
             encoder.eval()
@@ -137,12 +201,24 @@ def main():
                 val_pred_next = encoder.decode(val_z_next_pred)
                 val_pred_mse = loss_fn(val_pred_next, val_x[val_pairs + 1]).item()
                 val_recon_mse = loss_fn(encoder(val_x), val_x).item()
+
+                val_z = encoder.encode(val_x[val_window_starts])
+                val_roll_err = 0.0
+                for h in range(Htrain):
+                    val_z = dynamics(val_z, val_action[val_window_starts + h])
+                    val_roll_err += loss_fn(encoder.decode(val_z).clamp(0, 1),
+                                             val_x[val_window_starts + h + 1]).item()
+                val_roll_err /= Htrain
             print(f"epoch {epoch:3d}: train recon {total_recon / n:.5f}  train pred "
-                  f"{total_pred / n:.5f}  val recon {val_recon_mse:.5f}  val pred {val_pred_mse:.5f}")
+                  f"{total_pred / n:.5f}  train rollout {roll_loss_total:.5f}  val recon "
+                  f"{val_recon_mse:.5f}  val pred {val_pred_mse:.5f}  val {Htrain}step-rollout "
+                  f"{val_roll_err:.5f}")
 
     print(f"Final: val reconstruction MSE {val_recon_mse:.5f}, val one-step prediction MSE "
-          f"{val_pred_mse:.5f}, trivial baseline val MSE {baseline_val_mse:.5f} "
-          f"({'BEATS' if val_pred_mse < baseline_val_mse else 'DOES NOT beat'} the baseline).")
+          f"{val_pred_mse:.5f} (trivial baseline {baseline_val_mse:.5f}, "
+          f"{'BEATS' if val_pred_mse < baseline_val_mse else 'DOES NOT beat'} it); "
+          f"val {Htrain}-step rollout MSE {val_roll_err:.5f} (trivial {Htrain}-step baseline "
+          f"{baseline_roll:.5f}, {'BEATS' if val_roll_err < baseline_roll else 'DOES NOT beat'} it).")
 
     ckpt_path = Path(args.checkpoint)
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)

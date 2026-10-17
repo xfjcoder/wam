@@ -76,11 +76,13 @@ an existing one.
 11. **Fix Stage 10's indecisive-lingering mechanism directly** -- DONE (hysteresis/smoothness
     term implemented, tuned, measured twice -- inconclusive, closed; see below).
 12. **Pixel-rendering mini-plan: onboard camera, a small dataset, an encoder sanity check,
-    and a first latent-dynamics check** -- DONE (camera infra + a real rendering bug found
-    and fixed + a small autoencoder learns real structure + a frozen-encoder latent dynamics
-    model shows a weak one-step win but degrades fast under rollout; see below). Honest,
-    mixed result -- a jointly-trained encoder+dynamics model is the natural next idea, not
-    attempted here.
+    a frozen-latent dynamics check, and a joint-training attempt** -- DONE (camera infra + a
+    real rendering bug found and fixed + a small autoencoder learns real structure + a
+    frozen-encoder latent dynamics model shows a weak one-step win but degrades fast under
+    rollout + joint training doesn't fix that rollout degradation either, closed; see below).
+    Honest, mixed-to-negative result throughout -- not a working pixel-conditioned world
+    model yet; the most specific remaining idea (H-step rollout loss during training, not
+    just one-step) is flagged but not attempted.
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -909,7 +911,43 @@ already weak, not just the rollout. A frozen, reconstruction-only encoder's late
 not obviously well-suited to prediction; the more promising next move, if this is picked back
 up, is likely training the encoder and dynamics model jointly (so the latent is shaped by
 what's useful to PREDICT, not just what's useful to reconstruct) rather than further tuning
-this frozen-encoder setup. Not attempted here -- a deliberately bigger, separate step.
+this frozen-encoder setup.
+
+**Step 7 -- tried the joint-training idea step 6 flagged -- doesn't fix the rollout, closed.**
+`train_pixel_world_model.py` trains the SAME `ConvAutoencoder`/`LatentDynamics` classes
+together from a fresh random init (not starting from step 5/6's checkpoints), on a combined
+loss over every `(frame_t, action, frame_{t+1})` triple: reconstruction loss on both frames
+(keeps the latent anchored/decodable) plus a PIXEL-space prediction loss
+(`decode(dynamics(encode(frame_t), action))` vs `frame_{t+1}`) -- equal weight on both,
+untuned, since the question was whether the basic idea helps at all before investing in
+weight-tuning.
+
+| check | result |
+|---|---|
+| val reconstruction MSE | 0.00008 -- as good as or slightly better than step 5's reconstruction-only 0.00011 (joint training did NOT hurt reconstruction) |
+| val one-step PIXEL-space prediction MSE vs. trivial "predict frame_t for frame_{t+1}" baseline | 0.00010 vs 0.00009 -- does NOT beat the baseline |
+| 5-step autoregressive rollout, decoded every step (`media/pixel_world_model_rollout.png`) | visually near-identical to step 6's: sharp at step 0, visibly blurred by step 1, stays degraded the rest of the way |
+
+Worth being precise about what the pixel-space baseline comparison actually shows: it's a
+much harder baseline to beat than step 6's LATENT-space baseline was (0.00009 vs 0.00323) --
+on this mostly-flat-floor dataset at a 50ms macro-step, raw pixel MSE is dominated by the
+large, correctly-near-static majority of each frame, which dilutes the signal from the small
+amount of genuinely moving content (the tile boundaries' subtle shift) that actually indicates
+whether the model understands motion. The ROLLOUT comparison remains the most informative
+check here, and on that one, joint training made no visible difference.
+
+**Honest conclusion, closed**: jointly training the encoder and dynamics model does not hurt
+reconstruction and is a clean, reusable implementation, but it did NOT fix step 6's
+fast-rollout-degradation problem on this dataset/architecture/weighting -- a real, measured,
+negative result for the specific hypothesis "joint training will make the latent more
+predictable," not a confirmation of it. The most specific next idea, if this is revisited, is
+training on an H-STEP rollout loss (not just one-step prediction) the way `train_world_model.py`
+itself already had to for the low-dim state model (Stage 1's own README: one-step loss alone
+looked fine and still diverged catastrophically under rollout) -- this run only ever
+supervised a single step ahead, so there was no direct pressure on the model to stay accurate
+under its OWN compounding predictions. Not attempted here -- a bigger, separate step, and
+closed for now with the same "measured, found real negative, report honestly" discipline as
+Stage 7/11.
 
 ## Repository layout
 
@@ -951,6 +989,7 @@ wam/
 ├── check_onboard_camera.py                        # Stage 12: scripted real-physics camera sanity check
 ├── train_pixel_encoder.py                           # Stage 12: trains pixel_encoder.py's ConvAutoencoder
 ├── train_pixel_dynamics.py                            # Stage 12 step 6: trains pixel_dynamics.py on frozen latents
+├── train_pixel_world_model.py                           # Stage 12 step 7: joint encoder+dynamics training
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth
@@ -959,6 +998,7 @@ wam/
 ├── checkpoints/world_model_chunked_large.pt  # Stage 6's chunked-model checkpoint
 ├── checkpoints/pixel_encoder.pt         # Stage 12's ConvAutoencoder checkpoint
 ├── checkpoints/pixel_dynamics.pt         # Stage 12 step 6's LatentDynamics checkpoint
+├── checkpoints/pixel_world_model.pt        # Stage 12 step 7's jointly-trained checkpoint
 ├── media/rollout_comparison.png  # Stage 1's verification plot
 ├── media/rollout_comparison_terrain.png  # Stage 4's verification plot (on terrain)
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo
@@ -971,6 +1011,8 @@ wam/
 ├── media/camera_sanity/                          # Stage 12's paired RGB/depth sanity-check frames
 ├── media/pixel_encoder_reconstructions.png         # Stage 12's original-vs-reconstructed grid
 ├── media/pixel_dynamics_rollout.png                  # Stage 12 step 6's ground-truth-vs-rollout grid
+├── media/pixel_world_model_reconstructions.png         # Stage 12 step 7's reconstruction grid
+├── media/pixel_world_model_rollout.png                   # Stage 12 step 7's ground-truth-vs-rollout grid
 ├── requirements.txt
 └── README.md
 ```

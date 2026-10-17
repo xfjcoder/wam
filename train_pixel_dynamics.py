@@ -29,20 +29,8 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from wam.pixel_encoder import ConvAutoencoder  # noqa: E402
-from wam.pixel_dynamics import LatentDynamics  # noqa: E402
-
-
-def to_tensor_01(pixels_u8: np.ndarray) -> torch.Tensor:
-    t = torch.as_tensor(pixels_u8, dtype=torch.float32) / 255.0
-    return t.permute(0, 3, 1, 2).contiguous()
-
-
-def consecutive_pairs(episode_ids: np.ndarray) -> np.ndarray:
-    """Indices i such that (i, i+1) are consecutive transitions of the SAME episode --
-    i.e. frame[i+1] really is frame[i]'s next frame, not some other episode's first frame."""
-    same_episode = episode_ids[:-1] == episode_ids[1:]
-    return np.nonzero(same_episode)[0]
+from wam.pixel_encoder import ConvAutoencoder, to_tensor_01    # noqa: E402
+from wam.pixel_dynamics import LatentDynamics, consecutive_pairs  # noqa: E402
 
 
 def main():

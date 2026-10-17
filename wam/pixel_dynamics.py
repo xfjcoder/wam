@@ -8,8 +8,18 @@ step only asks whether a small predictor can move around in that already-learned
 space, not whether jointly training an encoder+dynamics model end-to-end would do better
 (a bigger, separate question for later if this works at all).
 """
+import numpy as np
 import torch
 import torch.nn as nn
+
+
+def consecutive_pairs(episode_ids: np.ndarray) -> np.ndarray:
+    """Indices i such that (i, i+1) are consecutive transitions of the SAME episode --
+    i.e. frame[i+1] really is frame[i]'s next frame, not some other episode's first frame.
+    (train_world_model.py's build_window_starts does the same thing for horizon-H windows;
+    this is the horizon=1 case, used by every pixel-dynamics training script.)"""
+    same_episode = episode_ids[:-1] == episode_ids[1:]
+    return np.nonzero(same_episode)[0]
 
 
 class LatentDynamics(nn.Module):

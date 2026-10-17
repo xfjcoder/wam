@@ -11,8 +11,15 @@ dataset is a few thousand frames from a handful of episodes, not worth a large m
 small model's reconstruction quality is a more honest test of "is the signal learnable" than
 a large model's (which could memorize instead).
 """
+import numpy as np
 import torch
 import torch.nn as nn
+
+
+def to_tensor_01(pixels_u8: np.ndarray) -> torch.Tensor:
+    """(N, H, W, 3) uint8 -> (N, 3, H, W) float32 in [0, 1]."""
+    t = torch.as_tensor(pixels_u8, dtype=torch.float32) / 255.0
+    return t.permute(0, 3, 1, 2).contiguous()
 
 
 class ConvAutoencoder(nn.Module):

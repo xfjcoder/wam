@@ -41,7 +41,9 @@ an existing one.
 - **Low-dimensional state prediction first, not pixels or a learned latent space.** The
   simplest version of this problem (direct state-to-state regression, a small MLP) gets
   built and verified before anything more ambitious -- same staged discipline as
-  `slam_sim`'s own kinematic-robot-first choice.
+  `slam_sim`'s own kinematic-robot-first choice. (Stage 12 revisits this deliberately, as a
+  separate, explicitly-scoped exploration once Stages 1-11 were settled -- not a reversal of
+  this choice for the existing planner/navigation work, which keeps using low-dim state.)
 - **Stage 1 = prediction only; Stage 2 = use it for planning.** Verify the learned model's
   open-loop rollouts actually track the real simulator's before building anything on top of
   it. Only once that's trustworthy does it make sense to use the model for something (e.g.
@@ -73,6 +75,10 @@ an existing one.
     genuine wash; see below).
 11. **Fix Stage 10's indecisive-lingering mechanism directly** -- DONE (hysteresis/smoothness
     term implemented, tuned, measured twice -- inconclusive, closed; see below).
+12. **Pixel-rendering mini-plan: onboard camera, a small dataset, and a first encoder sanity
+    check** -- DONE (camera infra + a real rendering bug found and fixed + confirmed a small
+    autoencoder learns real structure from it; see below). Deliberately stops short of a
+    pixel-conditioned dynamics model -- that's a separate, bigger decision for later.
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -807,6 +813,74 @@ future attempt with a genuinely different idea (e.g. hysteresis on the global pl
 WAYPOINT choice instead of the raw command, which the `--verbose` traces suggest may be the
 more direct source of the flip-flopping) rather than re-tuning this same weight further.
 
+### Stage 12: pixel-rendering mini-plan -- camera infra, a real rendering bug, and a first encoder sanity check
+
+User asked "is it good time to try pixels based wam?" -- a genuine pivot candidate, since
+Stages 1-11 deliberately chose low-dim state over pixels (see Scoping decisions). Rather than
+jumping straight to a pixel-conditioned world model, this was scoped down to a mini-plan:
+build and verify the rendering infrastructure first, then do the smallest possible check that
+the pixel signal is learnable at all, before committing to any encoder/dynamics architecture.
+
+**Steps 1-2 -- onboard camera (`wam/camera.py`)**: `inject_onboard_camera` string-splices
+`go1_rl_walk`'s own already-tuned `depth_cam` (body-fixed, ~26deg below horizontal,
+`assets/go2_mesh_camera.xml`) into `go2_mesh_for_mpc.xml`, same injection convention
+`inject_moving_obstacle`/`inject_walls` already use. `OnboardCamera` wraps `mujoco.Renderer`
+for paired RGB+depth frames.
+
+**Step 3 -- sanity check found a real bug, not a mount problem**: `check_onboard_camera.py`
+drives the real sim at `slam_sim`'s `loop_corridor` island wall. Every pitch angle tried (5,
+10, 15, 20, 26 degrees -- the last while genuinely exploring whether a NEW mount was needed)
+showed the SAME result: the wall never appeared in RGB or depth, even at literal physical
+contact. Root cause, confirmed directly: `mj.Renderer.update_scene()`'s default `MjvOption`
+only shows geom groups 0-2 (`mj.MjvOption().geomgroup == [1, 1, 1, 0, 0, 0]`), while
+`inject_walls`/`inject_moving_obstacle` both place their geoms in group 4 -- a "declutter
+casual viewers" convention lidar/`mj_ray` never had to respect, since their group filtering
+is passed explicitly per call. A rasterized camera silently inherits that default instead.
+**Fixed** by passing an explicit all-groups-visible `MjvOption` to every `OnboardCamera`
+render call. Verified against raw `mj_ray` ground truth (a vertical angle sweep from the
+camera's own position hit `wall_7` across a clean ~30 degree band) that the wall was
+geometrically in frame the entire time.
+
+**Conclusion: no new camera mount needed.** Once the render-group bug was fixed,
+`go1_rl_walk`'s existing `depth_cam` -- designed there for near-field ground/terrain sensing
+-- also cleanly shows chest-height obstacles: a monotonically growing gray wall band in RGB
+and a matching depth shrink (2.53m -> 1.63m -> 0.91m -> 0.46m) as the robot approaches,
+confirmed in both static teleport tests and real scripted locomotion. Reused as-is.
+
+**Step 4 -- `collect_data.py --record-pixels`**: captures one paired RGB+depth frame per
+transition at the same macro-step instant as `state_t`, saved as
+`train/val_pixels_rgb`/`_depth` in the same `.npz`, index-aligned with `train/val_states`.
+Off by default; every other saved array is byte-identical whether the flag is set or not.
+
+**Step 5 -- does a small encoder actually learn this?** Collected a small dataset
+(`data/rollouts_pixels.npz`: 15 train + 5 val episodes, flat ground, 64x64 RGB -- 1683 train
+/ 600 val frames) and trained `wam/pixel_encoder.py`'s `ConvAutoencoder` (4 conv layers down
+to a 32-dim latent, symmetric transposed-conv decoder) purely on reconstruction loss, with a
+trivial baseline for comparison (predicting the mean training frame for every input,
+regardless of content):
+
+| model | val MSE |
+|---|---|
+| trivial baseline (mean training frame) | 0.00086 |
+| ConvAutoencoder (32-dim latent), after 60 epochs | **0.00011** |
+
+An 8x improvement over the trivial baseline, and train/val MSE tracked each other closely
+throughout training (no overfitting gap) -- the 32-dim bottleneck is genuinely compressing
+per-frame structure, not memorizing. Visual spot-check
+(`media/pixel_encoder_reconstructions.png`) confirms this qualitatively: the floor's checker
+texture and tile boundaries are reconstructed in roughly the right positions, just softened
+-- the expected signature of a small bottleneck, not a degenerate (blank or copy-paste)
+reconstruction.
+
+**Honest scope of this result**: this is a reconstruction-only autoencoder on mostly-flat-
+floor frames (this dataset's episodes didn't drive near the island wall), trained and
+evaluated on frames from the SAME small handful of episodes' distribution. It answers
+exactly one question -- "does this specific camera's pixel stream contain learnable, non-
+trivial structure a small CNN can compress" -- and the answer is yes. It does NOT yet show
+that a pixel-derived latent is useful for dynamics prediction or planning; that would need a
+pixel-conditioned world model (predicting forward in time, not just reconstructing the
+present frame) and is a deliberately separate, bigger decision for a future session.
+
 ## Repository layout
 
 ```
@@ -821,8 +895,11 @@ wam/
 │   ├── chunked_model.py       # Stage 6: history-conditioned, action-chunked transformer
 │   ├── chunked_planner.py      # Stage 6: CEM planner shooting through the chunked model
 │   ├── moving_obstacle.py       # Stage 8: mocap-body moving obstacle, injected into the XML
-│   └── obstacle_tracker.py       # Stage 9/10: dynamic-vs-static classification + multi-track velocity tracking
+│   ├── obstacle_tracker.py       # Stage 9/10: dynamic-vs-static classification + multi-track velocity tracking
+│   ├── camera.py                  # Stage 12: onboard RGB+depth camera injection + rendering
+│   └── pixel_encoder.py            # Stage 12: small conv autoencoder for the RGB frames
 ├── collect_data.py      # Stage 1: generate rollouts from the real Go2 + classical MPC
+│                            # (Stage 12: --record-pixels captures paired RGB+depth too)
 ├── train_world_model.py   # Stage 1: one-step + H-step rollout loss training
 ├── train_chunked_world_model.py  # Stage 6: trains chunked_model.py on the same data
 ├── eval_rollout.py          # Stage 1: open-loop rollout vs. real simulator, numeric + plot
@@ -840,11 +917,15 @@ wam/
 ├── eval_obstacle_extrapolation.py           # Stage 9: multi-seed/phase frozen-vs-extrapolated comparison
 ├── navigate_wam_multi_obstacle.py             # Stage 10: obstacle-aware planning vs. TWO moving obstacles
 ├── eval_multi_obstacle.py                       # Stage 10: multi-seed/phase 3-condition comparison
+├── check_onboard_camera.py                        # Stage 12: scripted real-physics camera sanity check
+├── train_pixel_encoder.py                           # Stage 12: trains pixel_encoder.py's ConvAutoencoder
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
+├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth
 ├── checkpoints/world_model.pt   # Stage 1-3's checkpoint (flat-ground data only)
 ├── checkpoints/world_model_terrain.pt  # Stage 4's checkpoint (terrain-inclusive data)
 ├── checkpoints/world_model_chunked_large.pt  # Stage 6's chunked-model checkpoint
+├── checkpoints/pixel_encoder.pt         # Stage 12's ConvAutoencoder checkpoint
 ├── media/rollout_comparison.png  # Stage 1's verification plot
 ├── media/rollout_comparison_terrain.png  # Stage 4's verification plot (on terrain)
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo
@@ -854,6 +935,8 @@ wam/
 ├── media/navigate_wam_moving_*.gif         # Stage 8's moving-obstacle robot + map demos
 ├── media/navigate_wam_extrapolation_*.gif    # Stage 9's velocity-extrapolation robot + map demos
 ├── media/navigate_wam_multi_*.gif              # Stage 10's two-obstacle robot + map demos
+├── media/camera_sanity/                          # Stage 12's paired RGB/depth sanity-check frames
+├── media/pixel_encoder_reconstructions.png         # Stage 12's original-vs-reconstructed grid
 ├── requirements.txt
 └── README.md
 ```

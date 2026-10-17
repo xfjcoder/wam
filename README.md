@@ -77,13 +77,13 @@ an existing one.
     term implemented, tuned, measured twice -- inconclusive, closed; see below).
 12. **Pixel-rendering mini-plan: onboard camera, a small dataset, an encoder sanity check,
     a frozen-latent dynamics check, a joint-training attempt, an isolating experiment, the
-    H-step rollout loss fix, and three ways to get a stronger signal** -- DONE (camera infra +
-    a real rendering bug found and fixed + a small autoencoder learns real structure + a
-    frozen-encoder latent dynamics model shows a weak one-step win but degrades fast under
-    rollout + joint training doesn't fix that rollout degradation on flat ground + the SAME
-    method clearly works on a deliberately easy wall-approach scenario, confirming the earlier
-    failures were about signal strength/task difficulty, not a broken method + adding the
-    H-step rollout loss (Stage 1's own fix for the same failure mode) measurably improves
+    H-step rollout loss fix, three ways to get a stronger signal, and a usability check** --
+    DONE (camera infra + a real rendering bug found and fixed + a small autoencoder learns real
+    structure + a frozen-encoder latent dynamics model shows a weak one-step win but degrades
+    fast under rollout + joint training doesn't fix that rollout degradation on flat ground +
+    the SAME method clearly works on a deliberately easy wall-approach scenario, confirming the
+    earlier failures were about signal strength/task difficulty, not a broken method + adding
+    the H-step rollout loss (Stage 1's own fix for the same failure mode) measurably improves
     multi-step rollout accuracy on BOTH datasets and visibly cleans up compounding noise on the
     wall-approach data, but still can't manufacture a visually coherent rollout from flat
     ground's inherently weak signal + training on DEPTH instead of RGB is a dramatic win where
@@ -91,7 +91,12 @@ an existing one.
     mini-plan) but roughly neutral on flat ground (depth there is nearly constant, not noisy)
     + a diff-weighted loss is a null result on flat ground but a modest extra boost where
     signal is already strong + a richer, randomized-start/speed dataset confirms the
-    wall-approach win generalizes beyond one memorized trajectory; see below).
+    wall-approach win generalizes beyond one memorized trajectory, at a smaller margin + a
+    standalone checkpoint evaluator shows every tested checkpoint already holds up to a 20-step
+    rollout with no retraining needed, though depth's huge margin shrinks substantially once
+    combined with the varied dataset -- still not usable as a planner input (no turning/multi-
+    obstacle/open-ended data, no planner integration attempted), but rollout horizon and raw
+    signal strength are no longer the blockers; see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1111,6 +1116,52 @@ depth near obstacles rather than RGB is the first thing to try. Diff-weighting (
 minor, situational refinement, not a fix for weak-signal data. Varied data collection (step
 12) confirms the underlying win is a real, generalizing capability, not a memorized trick.
 
+### Steps 13-14: is pixel-based WAM usable yet? Combine depth + varied data, and check how far the rollout actually holds
+
+User asked directly: still not usable, anything else? Two concrete, cheap checks, both
+addressing real open questions rather than re-confirming what's already known.
+
+**Step 13: a standalone checkpoint-rollout evaluator** (`eval_pixel_rollout.py`) -- every
+prior pixel-WAM check (steps 6-12) only ever looked at a 5-step rollout, but the real CEM
+planner looks ahead much further (10-20 macro-steps). Loads an already-trained checkpoint (no
+retraining) and reports PER-STEP accuracy over a longer horizon on held-out validation
+windows -- the cheapest possible way to ask "how far out does an existing model's accuracy
+hold" before deciding whether retraining at a longer horizon is even necessary.
+
+Tested 3 checkpoints at horizon=20 (4x longer than anything checked before):
+
+| checkpoint | step 1 pred MSE (baseline) | step 20 pred MSE (baseline) | beats baseline every step? |
+|---|---|---|---|
+| RGB, H-step loss, fixed trajectory (step 9) | 0.00042 (0.00063) | 0.00302 (0.00992) | **yes, 1-20**, margin widens (baseline grows ~16x, pred error only ~7x) |
+| depth, fixed trajectory (step 10) | 0.00003 (0.00004) | 0.00008 (0.00308) | **yes, 1-20** -- error stays nearly FLAT the whole way while baseline grows ~80x, by far the most robust result in this mini-plan |
+| depth, VARIED start/speed (step 12 + step 14 below) | 0.00005 (0.00005, tied) | 0.00363 (0.00575) | yes from step 2 on, but margin shrinks steadily (~3x early, ~1.3-1.6x by step 20), absolute error grows ~70x |
+
+None of these three were ever trained with a rollout loss longer than 5 steps, yet all three
+still beat (or roughly tie, in one case) a trivial baseline at every step out to 20 -- no
+retraining at a longer horizon was needed to answer this. But robustness differs sharply:
+fixed-trajectory depth barely degrades at all; fixed-trajectory RGB degrades but the baseline
+degrades faster; VARIED depth (the case closest to realistic use) clearly still wins but with
+real, visible degradation -- same throughline as every earlier step: the cleaner/narrower the
+data, the better pixel-WAM's rollout holds up.
+
+**Step 14: depth + varied data combined** (`checkpoints/pixel_world_model_wall_demo_varied_depth.pt`,
+trained on step 12's randomized-start/speed dataset with `--modality depth`): val one-step
+prediction MSE 0.00027 vs. baseline 0.00061 (~2.3x) and val 5-step rollout MSE 0.00048 vs.
+baseline 0.00172 (~3.6x) -- both clear wins, but a much smaller margin than depth-on-the-fixed-
+trajectory's dramatic 9x (step 10), and a visibly noisier, non-monotonic training curve (the
+same "variety makes the optimization and the final margin harder" pattern step 12 already
+found for RGB, now confirmed for depth too).
+
+**Honest conclusion, both steps together**: depth's huge win is partly a function of how
+narrow/clean the data is -- combine it with more realistic variety and the margin shrinks
+substantially (still real, not gone). Separately, the rollout-horizon concern that could have
+been a blocker (every prior result only checked 5 steps) is NOT currently a blocker -- every
+checkpoint tested held up to 20 steps without any retraining. **Still not usable as a planner
+input**: nothing here tests turning, multiple obstacles, or open-ended random-command
+exploration, and no depth-based obstacle cost has ever been wired into the CEM planner --
+those remain the real next steps if this track gets picked up for actual use, not rollout
+horizon or raw signal strength (both now reasonably addressed).
+
 ## Repository layout
 
 ```
@@ -1158,6 +1209,7 @@ wam/
 │                                                             #  step 10: + --modality depth; step 11: + --loss-weighting diff)
 ├── collect_wall_approach_demo.py                          # Stage 12 step 8: scripted wall-approach/retreat dataset
 ├── collect_wall_approach_varied_demo.py                     # Stage 12 step 12: randomized start-y/speed variant
+├── eval_pixel_rollout.py                                      # Stage 12 step 13: per-step long-horizon checkpoint evaluator
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth
@@ -1177,6 +1229,7 @@ wam/
 ├── checkpoints/pixel_world_model_diff.pt                  # Stage 12 step 11's checkpoint (flat-ground, diff-weighted)
 ├── checkpoints/pixel_world_model_wall_demo_diff.pt          # Stage 12 step 11's checkpoint (wall-approach, diff-weighted)
 ├── checkpoints/pixel_world_model_wall_demo_varied.pt           # Stage 12 step 12's checkpoint (varied start/speed)
+├── checkpoints/pixel_world_model_wall_demo_varied_depth.pt       # Stage 12 step 14's checkpoint (varied start/speed, depth)
 ├── media/rollout_comparison.png  # Stage 1's verification plot
 ├── media/rollout_comparison_terrain.png  # Stage 4's verification plot (on terrain)
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo
@@ -1207,6 +1260,9 @@ wam/
 ├── media/pixel_world_model_wall_demo_diff_rollout.png                                  # Stage 12 step 11's rollout grid (wall-approach, diff-weighted)
 ├── media/pixel_world_model_wall_demo_varied_reconstructions.png                           # Stage 12 step 12's reconstruction grid
 ├── media/pixel_world_model_wall_demo_varied_rollout.png                                     # Stage 12 step 12's rollout grid
+├── media/pixel_world_model_wall_demo_varied_depth_reconstructions.png                          # Stage 12 step 14's reconstruction grid
+├── media/pixel_world_model_wall_demo_varied_depth_rollout.png                                    # Stage 12 step 14's 5-step rollout grid
+├── media/pixel_world_model_wall_demo_varied_depth_horizon20_rollout.png                             # Stage 12 step 13's 20-step rollout grid (varied+depth)
 ├── requirements.txt
 └── README.md
 ```

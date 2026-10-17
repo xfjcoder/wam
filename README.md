@@ -75,10 +75,12 @@ an existing one.
     genuine wash; see below).
 11. **Fix Stage 10's indecisive-lingering mechanism directly** -- DONE (hysteresis/smoothness
     term implemented, tuned, measured twice -- inconclusive, closed; see below).
-12. **Pixel-rendering mini-plan: onboard camera, a small dataset, and a first encoder sanity
-    check** -- DONE (camera infra + a real rendering bug found and fixed + confirmed a small
-    autoencoder learns real structure from it; see below). Deliberately stops short of a
-    pixel-conditioned dynamics model -- that's a separate, bigger decision for later.
+12. **Pixel-rendering mini-plan: onboard camera, a small dataset, an encoder sanity check,
+    and a first latent-dynamics check** -- DONE (camera infra + a real rendering bug found
+    and fixed + a small autoencoder learns real structure + a frozen-encoder latent dynamics
+    model shows a weak one-step win but degrades fast under rollout; see below). Honest,
+    mixed result -- a jointly-trained encoder+dynamics model is the natural next idea, not
+    attempted here.
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -879,7 +881,35 @@ exactly one question -- "does this specific camera's pixel stream contain learna
 trivial structure a small CNN can compress" -- and the answer is yes. It does NOT yet show
 that a pixel-derived latent is useful for dynamics prediction or planning; that would need a
 pixel-conditioned world model (predicting forward in time, not just reconstructing the
-present frame) and is a deliberately separate, bigger decision for a future session.
+present frame) -- which Step 6 below checks directly.
+
+**Step 6 -- "Stage 1 for pixels": does the encoder's latent support PREDICTION, not just
+reconstruction?** `wam/pixel_dynamics.py`'s `LatentDynamics` is the direct pixel analogue of
+Stage 1's own `WorldModel`: a small MLP predicting a DELTA in latent space from `(current
+latent, action)`, trained on top of the step-5 encoder's latent -- FROZEN, not fine-tuned.
+Consecutive pixel frames within the same episode double as `(frame_t, action, frame_{t+1})`
+triples with zero new data collection (`train_pixel_dynamics.py`'s `consecutive_pairs`,
+the horizon=1 case of `train_world_model.py`'s own episode-boundary-respecting window logic).
+
+| check | result |
+|---|---|
+| one-step latent-delta MSE vs. trivial "predict no change" baseline | 0.00242 vs 0.00323 (model wins, but only ~25%, not step 5's ~8x) |
+| val MSE over training | bottoms out around epoch 40 (0.00220), creeps back up to 0.00242 by epoch 100 while train MSE keeps falling -- mild overfitting on this small dataset |
+| 5-step autoregressive rollout, decoded back to images every step (`media/pixel_dynamics_rollout.png`) | ground truth stays sharp throughout; the rollout's checker-tile detail is already visibly blurred by step 1 and stays degraded (not collapsed to a blank frame, but clearly lower-fidelity) for the rest of the rollout |
+
+Isolated WHERE the degradation comes from before concluding anything: decoding the TRUE next
+latent (not the model's prediction) for the same frame still reconstructs the sharp tile
+pattern, matching step 5's own quality -- so this is real one-step LATENT PREDICTION error
+compounding under rollout, not a decoder limitation.
+
+**Honest conclusion**: the modest one-step win plus fast-compounding rollout degradation is
+the same pattern Stage 1 itself first found with the low-dim state model (one-step metrics
+alone don't guarantee good autoregressive behavior) -- except here the one-step win itself is
+already weak, not just the rollout. A frozen, reconstruction-only encoder's latent space is
+not obviously well-suited to prediction; the more promising next move, if this is picked back
+up, is likely training the encoder and dynamics model jointly (so the latent is shaped by
+what's useful to PREDICT, not just what's useful to reconstruct) rather than further tuning
+this frozen-encoder setup. Not attempted here -- a deliberately bigger, separate step.
 
 ## Repository layout
 
@@ -897,7 +927,8 @@ wam/
 │   ├── moving_obstacle.py       # Stage 8: mocap-body moving obstacle, injected into the XML
 │   ├── obstacle_tracker.py       # Stage 9/10: dynamic-vs-static classification + multi-track velocity tracking
 │   ├── camera.py                  # Stage 12: onboard RGB+depth camera injection + rendering
-│   └── pixel_encoder.py            # Stage 12: small conv autoencoder for the RGB frames
+│   ├── pixel_encoder.py            # Stage 12: small conv autoencoder for the RGB frames
+│   └── pixel_dynamics.py            # Stage 12 step 6: latent-space delta predictor (frozen encoder)
 ├── collect_data.py      # Stage 1: generate rollouts from the real Go2 + classical MPC
 │                            # (Stage 12: --record-pixels captures paired RGB+depth too)
 ├── train_world_model.py   # Stage 1: one-step + H-step rollout loss training
@@ -919,6 +950,7 @@ wam/
 ├── eval_multi_obstacle.py                       # Stage 10: multi-seed/phase 3-condition comparison
 ├── check_onboard_camera.py                        # Stage 12: scripted real-physics camera sanity check
 ├── train_pixel_encoder.py                           # Stage 12: trains pixel_encoder.py's ConvAutoencoder
+├── train_pixel_dynamics.py                            # Stage 12 step 6: trains pixel_dynamics.py on frozen latents
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth
@@ -926,6 +958,7 @@ wam/
 ├── checkpoints/world_model_terrain.pt  # Stage 4's checkpoint (terrain-inclusive data)
 ├── checkpoints/world_model_chunked_large.pt  # Stage 6's chunked-model checkpoint
 ├── checkpoints/pixel_encoder.pt         # Stage 12's ConvAutoencoder checkpoint
+├── checkpoints/pixel_dynamics.pt         # Stage 12 step 6's LatentDynamics checkpoint
 ├── media/rollout_comparison.png  # Stage 1's verification plot
 ├── media/rollout_comparison_terrain.png  # Stage 4's verification plot (on terrain)
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo
@@ -937,6 +970,7 @@ wam/
 ├── media/navigate_wam_multi_*.gif              # Stage 10's two-obstacle robot + map demos
 ├── media/camera_sanity/                          # Stage 12's paired RGB/depth sanity-check frames
 ├── media/pixel_encoder_reconstructions.png         # Stage 12's original-vs-reconstructed grid
+├── media/pixel_dynamics_rollout.png                  # Stage 12 step 6's ground-truth-vs-rollout grid
 ├── requirements.txt
 └── README.md
 ```

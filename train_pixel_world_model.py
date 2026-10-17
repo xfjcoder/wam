@@ -36,6 +36,27 @@ of those steps (see wam/pixel_dynamics.py's build_window_starts for the frame-ad
 windows this needs). Backprops through H repeated dynamics+decode applications (BPTT-style),
 same gradient-spike risk train_world_model.py already guards against with --grad-clip.
 
+Step 10: `--modality depth` trains on the SAME recording's depth channel instead of RGB (one
+flag, zero new data collection -- collect_data.py/collect_wall_approach_demo.py already
+capture both every episode). Depth directly encodes metric distance-to-obstacle -- the actual
+quantity worth predicting for obstacle sensing -- instead of forcing the model to track an
+incidental, subtle sub-pixel texture shift the way flat-ground RGB does. `ConvAutoencoder`
+gained a `channels` arg (3 for RGB, 1 for depth) and `wam/pixel_encoder.py` gained
+`depth_to_tensor_01` (clips metric depth to `--depth-clip` meters before normalizing -- raw
+depth has sky/no-geometry pixels reading back at the renderer's far plane, ~200m on the
+flat-ground dataset, which would otherwise swamp the loss).
+
+Step 11: `--loss-weighting diff` reweights the PREDICTION and rollout losses (not
+reconstruction, which isn't about change) by how much each pixel actually moved between
+consecutive ground-truth frames (`1 + --diff-weight-scale * |frame_next - frame_t|`,
+normalized to mean 1 per batch so the overall loss scale is comparable to the unweighted
+case). On a mostly-static scene (flat-ground RGB's dominant failure mode) plain per-pixel MSE
+is overwhelmingly dominated by the large, correctly-near-static majority of the frame,
+diluting the gradient signal from the small informative region that's actually predictable.
+This directly targets that dilution -- evaluation metrics (the baselines and final MSEs
+printed/compared) stay the standard UNWEIGHTED pixel MSE throughout, only the training
+objective changes, so "beats baseline" comparisons remain honest/apples-to-apples.
+
 Usage (needs go1_rl_walk/mpc's own venv for torch):
     /home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 train_pixel_world_model.py \
         --data data/rollouts_pixels.npz --checkpoint checkpoints/pixel_world_model.pt
@@ -49,8 +70,29 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from wam.pixel_encoder import ConvAutoencoder, to_tensor_01                           # noqa: E402
+from wam.pixel_encoder import ConvAutoencoder, to_tensor_01, depth_to_tensor_01       # noqa: E402
 from wam.pixel_dynamics import LatentDynamics, consecutive_pairs, build_window_starts  # noqa: E402
+
+
+def frames_to_uint8(t: torch.Tensor) -> np.ndarray:
+    """(B, C, H, W) float in [0, 1] -> (B, H, W, 3) uint8 -- replicates a single depth
+    channel to RGB so both modalities save through the same grid-building code below."""
+    arr = t.clamp(0, 1).detach().numpy()
+    if arr.shape[1] == 1:
+        arr = np.repeat(arr, 3, axis=1)
+    return (arr.transpose(0, 2, 3, 1) * 255).astype(np.uint8)
+
+
+def diff_weighted_mse(pred: torch.Tensor, target: torch.Tensor, ref: torch.Tensor,
+                       scale: float) -> torch.Tensor:
+    """MSE(pred, target), with each pixel weighted by how much `target` actually changed
+    from `ref` (the previous ground-truth frame) -- weight = 1 + scale * |target - ref|,
+    normalized to mean 1 so the overall loss magnitude stays comparable to plain MSE. The
+    weight is a stop-gradient target statistic, not a model output."""
+    with torch.no_grad():
+        weight = 1.0 + scale * (target - ref).abs()
+        weight = weight / weight.mean()
+    return (weight * (pred - target) ** 2).mean()
 
 
 def refit_normalization(encoder, dynamics, train_x, train_action, train_pairs):
@@ -67,6 +109,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=str, default="data/rollouts_pixels.npz")
     ap.add_argument("--checkpoint", type=str, default="checkpoints/pixel_world_model.pt")
+    ap.add_argument("--modality", type=str, default="rgb", choices=["rgb", "depth"],
+                     help="train on RGB frames or the same recording's depth channel")
+    ap.add_argument("--depth-clip", type=float, default=3.0,
+                     help="meters -- depth is clipped to this before normalizing to [0, 1] "
+                          "(only used when --modality depth)")
     ap.add_argument("--latent-dim", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--batch-size", type=int, default=64)
@@ -84,6 +131,12 @@ def main():
                           "train_world_model.py's --rollout-horizon")
     ap.add_argument("--rollout-batches-per-epoch", type=int, default=10)
     ap.add_argument("--rollout-batch-size", type=int, default=16)
+    ap.add_argument("--loss-weighting", type=str, default="none", choices=["none", "diff"],
+                     help="'diff' reweights the PREDICTION and rollout losses toward pixels "
+                          "that actually changed frame-to-frame (see module docstring); "
+                          "reconstruction loss and all evaluation metrics stay unweighted")
+    ap.add_argument("--diff-weight-scale", type=float, default=5.0,
+                     help="only used when --loss-weighting diff")
     ap.add_argument("--grad-clip", type=float, default=1.0,
                      help="max gradient norm, applied to both loss passes -- the H-step "
                           "rollout loss backprops through H repeated dynamics+decode "
@@ -99,8 +152,14 @@ def main():
     data = np.load(args.data)
     resolution = int(data["pixel_resolution"])
 
-    train_x = to_tensor_01(data["train_pixels_rgb"])
-    val_x = to_tensor_01(data["val_pixels_rgb"])
+    if args.modality == "rgb":
+        channels = 3
+        train_x = to_tensor_01(data["train_pixels_rgb"])
+        val_x = to_tensor_01(data["val_pixels_rgb"])
+    else:
+        channels = 1
+        train_x = depth_to_tensor_01(data["train_pixels_depth"], clip=args.depth_clip)
+        val_x = depth_to_tensor_01(data["val_pixels_depth"], clip=args.depth_clip)
     train_action = torch.as_tensor(data["train_actions"], dtype=torch.float32)
     val_action = torch.as_tensor(data["val_actions"], dtype=torch.float32)
     train_pairs = consecutive_pairs(data["train_episode_ids"])
@@ -114,7 +173,7 @@ def main():
     print(f"Rollout-loss windows (horizon={Htrain}): {len(train_window_starts)} train, "
           f"{len(val_window_starts)} val.")
 
-    encoder = ConvAutoencoder(latent_dim=args.latent_dim, resolution=resolution)
+    encoder = ConvAutoencoder(latent_dim=args.latent_dim, resolution=resolution, channels=channels)
     dynamics = LatentDynamics(latent_dim=args.latent_dim, action_dim=train_action.shape[1])
     params = list(encoder.parameters()) + list(dynamics.parameters())
     opt = torch.optim.Adam(params, lr=args.lr)
@@ -161,7 +220,10 @@ def main():
             pred_next = encoder.decode(z_next_pred)
 
             recon_loss = loss_fn(recon_t, x_t) + loss_fn(recon_next, x_next)
-            pred_loss = loss_fn(pred_next, x_next)
+            if args.loss_weighting == "diff":
+                pred_loss = diff_weighted_mse(pred_next, x_next, x_t, args.diff_weight_scale)
+            else:
+                pred_loss = loss_fn(pred_next, x_next)
             loss = args.w_recon * recon_loss + args.w_pred * pred_loss
 
             opt.zero_grad()
@@ -183,7 +245,12 @@ def main():
             loss = 0.0
             for h in range(Htrain):
                 z = dynamics(z, train_action[idx + h])
-                loss = loss + loss_fn(encoder.decode(z), train_x[idx + h + 1])
+                decoded = encoder.decode(z)
+                if args.loss_weighting == "diff":
+                    loss = loss + diff_weighted_mse(decoded, train_x[idx + h + 1],
+                                                      train_x[idx + h], args.diff_weight_scale)
+                else:
+                    loss = loss + loss_fn(decoded, train_x[idx + h + 1])
             loss = (loss / Htrain) * args.rollout_loss_weight
             opt.zero_grad()
             loss.backward()
@@ -223,8 +290,8 @@ def main():
     ckpt_path = Path(args.checkpoint)
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"encoder_state": encoder.state_dict(), "dynamics_state": dynamics.state_dict(),
-                "latent_dim": args.latent_dim, "resolution": resolution,
-                "action_dim": train_action.shape[1]}, ckpt_path)
+                "latent_dim": args.latent_dim, "resolution": resolution, "channels": channels,
+                "modality": args.modality, "action_dim": train_action.shape[1]}, ckpt_path)
     print(f"Saved checkpoint to {ckpt_path}")
 
     from PIL import Image
@@ -239,8 +306,7 @@ def main():
         show_idx = torch.linspace(0, len(val_x) - 1, n_show).long()
         originals = val_x[show_idx]
         recons = encoder(originals).clamp(0, 1)
-    grid = torch.cat([originals, recons], dim=2)
-    grid = (grid.permute(0, 2, 3, 1).numpy() * 255).astype(np.uint8)
+    grid = np.concatenate([frames_to_uint8(originals), frames_to_uint8(recons)], axis=1)
     row = np.concatenate(list(grid), axis=1)
     Path(args.recon_grid).parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(row).save(args.recon_grid)
@@ -258,15 +324,14 @@ def main():
     start = starts[len(starts) // 2]
 
     with torch.no_grad():
-        true_frames = [data["val_pixels_rgb"][start]]
-        pred_frames = [data["val_pixels_rgb"][start]]
+        true_frames = [frames_to_uint8(val_x[start:start + 1])[0]]
+        pred_frames = [frames_to_uint8(val_x[start:start + 1])[0]]
         z = encoder.encode(val_x[start:start + 1])
         for h in range(H):
             a = val_action[start + h:start + h + 1]
             z = dynamics(z, a)
-            true_frames.append(data["val_pixels_rgb"][start + h + 1])
-            decoded = encoder.decode(z).clamp(0, 1)[0].permute(1, 2, 0).numpy()
-            pred_frames.append((decoded * 255).astype(np.uint8))
+            true_frames.append(frames_to_uint8(val_x[start + h + 1:start + h + 2])[0])
+            pred_frames.append(frames_to_uint8(encoder.decode(z))[0])
 
     top = np.concatenate(true_frames, axis=1)
     bottom = np.concatenate(pred_frames, axis=1)

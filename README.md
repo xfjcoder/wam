@@ -76,17 +76,22 @@ an existing one.
 11. **Fix Stage 10's indecisive-lingering mechanism directly** -- DONE (hysteresis/smoothness
     term implemented, tuned, measured twice -- inconclusive, closed; see below).
 12. **Pixel-rendering mini-plan: onboard camera, a small dataset, an encoder sanity check,
-    a frozen-latent dynamics check, a joint-training attempt, an isolating experiment, and the
-    H-step rollout loss fix** -- DONE (camera infra + a real rendering bug found and fixed + a
-    small autoencoder learns real structure + a frozen-encoder latent dynamics model shows a
-    weak one-step win but degrades fast under rollout + joint training doesn't fix that
-    rollout degradation on flat ground + the SAME method clearly works on a deliberately easy
-    wall-approach scenario, confirming the earlier failures were about signal strength/task
-    difficulty, not a broken method + adding the H-step rollout loss (Stage 1's own fix for
-    the same failure mode) measurably improves multi-step rollout accuracy on BOTH datasets
-    and visibly cleans up compounding noise on the wall-approach data, but still can't
-    manufacture a visually coherent rollout from flat ground's inherently weak signal; see
-    below).
+    a frozen-latent dynamics check, a joint-training attempt, an isolating experiment, the
+    H-step rollout loss fix, and three ways to get a stronger signal** -- DONE (camera infra +
+    a real rendering bug found and fixed + a small autoencoder learns real structure + a
+    frozen-encoder latent dynamics model shows a weak one-step win but degrades fast under
+    rollout + joint training doesn't fix that rollout degradation on flat ground + the SAME
+    method clearly works on a deliberately easy wall-approach scenario, confirming the earlier
+    failures were about signal strength/task difficulty, not a broken method + adding the
+    H-step rollout loss (Stage 1's own fix for the same failure mode) measurably improves
+    multi-step rollout accuracy on BOTH datasets and visibly cleans up compounding noise on the
+    wall-approach data, but still can't manufacture a visually coherent rollout from flat
+    ground's inherently weak signal + training on DEPTH instead of RGB is a dramatic win where
+    there's a real distance to track (~9x over baseline, the best result in the whole
+    mini-plan) but roughly neutral on flat ground (depth there is nearly constant, not noisy)
+    + a diff-weighted loss is a null result on flat ground but a modest extra boost where
+    signal is already strong + a richer, randomized-start/speed dataset confirms the
+    wall-approach win generalizes beyond one memorized trajectory; see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1031,6 +1036,81 @@ in the data. Flat ground's signal is still too weak (a sub-pixel checker-texture
 ANY training-objective fix alone to produce a usable rollout; a strong, large, directly
 action-correlated signal (step 8's wall band) remains the thing that actually mattered.
 
+### Steps 10-12: three ways to get a stronger signal -- one clear win, one null result, one generalization check
+
+User asked directly: "any way to get a strong signal?" Three candidates, all tried, in order
+of expected payoff:
+
+**Step 10 -- train on DEPTH instead of RGB** (`--modality depth`, zero new data collection --
+both datasets already capture depth every episode). Depth directly encodes metric
+distance-to-obstacle, the actual quantity worth predicting for obstacle sensing, instead of an
+incidental sub-pixel texture shift. `ConvAutoencoder` gained a `channels` arg (1 for depth) and
+`wam/pixel_encoder.py` gained `depth_to_tensor_01` (clips to `--depth-clip` meters -- raw
+depth has sky/no-geometry pixels reading back at the renderer's far plane, ~200m on the
+flat-ground dataset, which would swamp the loss unclipped).
+
+| check | flat-ground, depth | wall-approach, depth |
+|---|---|---|
+| val one-step pred MSE vs. baseline | 0.00043 vs 0.00041 (does NOT beat it, essentially tied) | **0.00002 vs 0.00007 (beats it, ~3.5x)** |
+| val 5-step rollout MSE vs. baseline | 0.00060 vs 0.00092 (beats it, ~1.5x) | **0.00002 vs 0.00018 (beats it, ~9x -- the best result in this whole mini-plan)** |
+| rollout grid, visually (contrast-stretched for viewing -- raw depth values are too close to black at this scale) | nearly static gradient, both truth and prediction -- not really "tracking", more a near-degenerate task (depth barely changes on flat ground at all) | **closely tracks the real darkening/approaching gradient across all 5 steps**, matching the quantitative margin |
+
+**Honest conclusion**: depth is the single strongest lever tried in this mini-plan -- a 9x
+multi-step win, visually confirmed, on exactly the same wall-approach scenario RGB+H-step
+loss only managed ~3.9x on. But it is NOT a strong-signal fix for flat ground -- the
+diagnosis there is different for depth than for RGB: depth isn't noisy or subtle on flat
+ground, it's just nearly CONSTANT (a flat floor at a fixed camera height produces almost the
+same depth gradient regardless of forward motion), so there's no obstacle-distance signal to
+extract in the first place. Depth helps precisely where there's a distance that's actually
+changing -- i.e. near an obstacle, exactly where it would matter most for a real planner.
+
+**Step 11 -- a diff-weighted training loss** (`--loss-weighting diff`): reweights the
+PREDICTION and rollout losses (not reconstruction) by how much each pixel actually changed
+between consecutive ground-truth frames (`1 + scale * |frame_next - frame_t|`, normalized to
+mean 1 so the loss magnitude stays comparable), to stop the large, correctly-static majority
+of a frame from diluting the gradient signal from the small informative region. Evaluation
+metrics stay the standard unweighted MSE throughout -- only the training objective changes.
+
+| check | flat-ground, diff-weighted | wall-approach, diff-weighted |
+|---|---|---|
+| val one-step / 5-step rollout MSE | 0.00010 / 0.00016 -- **identical to step 9's plain H-step result to the last digit** | 0.00035 / 0.00038 -- a small additional improvement over step 9's 0.00039 / 0.00041 |
+| rollout grid, visually | still collapses to blur by step 1, unchanged | same correct band-growth tracking as step 9, comparably clean |
+
+**Honest conclusion**: a null result on flat ground -- reweighting toward "pixels that
+changed" cannot help when the change is this diffuse and small everywhere in the frame; there
+is no concentrated informative region to up-weight. This actually sharpens the step 8/9
+diagnosis further: flat ground's limitation isn't that signal is present but drowned out by
+loss dilution (which this would have fixed), it's that there is barely any signal to find at
+all. On wall-approach, where a real pocket of high-information pixels does exist, the
+reweighting gives a modest additional boost on top of the H-step loss -- a small, real, but
+not dramatic effect.
+
+**Step 12 -- a richer/varied environment** (`collect_wall_approach_varied_demo.py`): tests
+whether step 8/9's win was specific to ONE exact repeated trajectory or generalizes across
+varied encounters with the same obstacle. Same scripted approach/retreat oscillation, but each
+episode now starts at a randomly sampled y-position along the island's west wall (2.3-5.7,
+margined inside the wall's span so the approach always hits it squarely) and a randomly
+sampled speed (0.3-0.4) -- same safety guarantees, same recording format, 10 train + 3 val
+episodes, 2000/600 transitions, no falls.
+
+| check | fixed trajectory (step 9) | varied start/speed (step 12) |
+|---|---|---|
+| val one-step pred MSE vs. baseline | 0.00039 vs 0.00070 (~1.8x) | 0.00033 vs 0.00046 (~1.4x) |
+| val 5-step rollout MSE vs. baseline | 0.00041 vs 0.00158 (~3.9x) | 0.00037 vs 0.00080 (~2.2x) |
+| rollout grid, visually | tracks band growth across the whole window | correctly predicts "no wall yet, then it appears" for this (randomly drawn) validation window's own phase -- consistent with the model having learned the general approach dynamics, not one fixed curve |
+
+**Honest conclusion**: the method generalizes across varied start positions and speeds for
+the same obstacle, at a modest (expected) cost in margin-over-baseline -- more diverse data is
+a harder prediction problem, and the trivial baseline itself gets a bit stronger too (less of
+a single exploitable pattern). This is a real, if incremental, broadening of step 8/9's result
+beyond "one specific memorized trajectory."
+
+**Combined takeaway across all three**: depth is the standout lever (step 10) -- if this
+pixel-rendering track is ever picked up again for something closer to real use, training on
+depth near obstacles rather than RGB is the first thing to try. Diff-weighting (step 11) is a
+minor, situational refinement, not a fix for weak-signal data. Varied data collection (step
+12) confirms the underlying win is a real, generalizing capability, not a memorized trick.
+
 ## Repository layout
 
 ```
@@ -1048,6 +1128,7 @@ wam/
 │   ├── obstacle_tracker.py       # Stage 9/10: dynamic-vs-static classification + multi-track velocity tracking
 │   ├── camera.py                  # Stage 12: onboard RGB+depth camera injection + rendering
 │   ├── pixel_encoder.py            # Stage 12: small conv autoencoder for the RGB frames
+│   │                                 # (Stage 12 step 10: + channels arg, depth_to_tensor_01)
 │   └── pixel_dynamics.py            # Stage 12 step 6: latent-space delta predictor (frozen encoder)
 │                                      # (Stage 12 step 9: + build_window_starts for H-step windows)
 ├── collect_data.py      # Stage 1: generate rollouts from the real Go2 + classical MPC
@@ -1073,12 +1154,15 @@ wam/
 ├── train_pixel_encoder.py                           # Stage 12: trains pixel_encoder.py's ConvAutoencoder
 ├── train_pixel_dynamics.py                            # Stage 12 step 6: trains pixel_dynamics.py on frozen latents
 ├── train_pixel_world_model.py                           # Stage 12 step 7: joint encoder+dynamics training
-│                                                             # (Stage 12 step 9: + H-step rollout loss)
+│                                                             # (Stage 12 step 9: + H-step rollout loss;
+│                                                             #  step 10: + --modality depth; step 11: + --loss-weighting diff)
 ├── collect_wall_approach_demo.py                          # Stage 12 step 8: scripted wall-approach/retreat dataset
+├── collect_wall_approach_varied_demo.py                     # Stage 12 step 12: randomized start-y/speed variant
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth
 ├── data/rollouts_wall_demo.npz      # Stage 12 step 8: scripted wall-approach/retreat dataset
+├── data/rollouts_wall_demo_varied.npz # Stage 12 step 12: randomized start-y/speed variant
 ├── checkpoints/world_model.pt   # Stage 1-3's checkpoint (flat-ground data only)
 ├── checkpoints/world_model_terrain.pt  # Stage 4's checkpoint (terrain-inclusive data)
 ├── checkpoints/world_model_chunked_large.pt  # Stage 6's chunked-model checkpoint
@@ -1088,6 +1172,11 @@ wam/
 ├── checkpoints/pixel_world_model_wall_demo.pt # Stage 12 step 8's checkpoint (wall-approach data)
 ├── checkpoints/pixel_world_model_hstep.pt       # Stage 12 step 9's checkpoint (flat-ground + H-step loss)
 ├── checkpoints/pixel_world_model_wall_demo_hstep.pt # Stage 12 step 9's checkpoint (wall-approach + H-step loss)
+├── checkpoints/pixel_world_model_depth.pt             # Stage 12 step 10's checkpoint (flat-ground, depth)
+├── checkpoints/pixel_world_model_wall_demo_depth.pt     # Stage 12 step 10's checkpoint (wall-approach, depth)
+├── checkpoints/pixel_world_model_diff.pt                  # Stage 12 step 11's checkpoint (flat-ground, diff-weighted)
+├── checkpoints/pixel_world_model_wall_demo_diff.pt          # Stage 12 step 11's checkpoint (wall-approach, diff-weighted)
+├── checkpoints/pixel_world_model_wall_demo_varied.pt           # Stage 12 step 12's checkpoint (varied start/speed)
 ├── media/rollout_comparison.png  # Stage 1's verification plot
 ├── media/rollout_comparison_terrain.png  # Stage 4's verification plot (on terrain)
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo
@@ -1108,6 +1197,16 @@ wam/
 ├── media/pixel_world_model_hstep_rollout.png                     # Stage 12 step 9's rollout grid (flat-ground)
 ├── media/pixel_world_model_wall_demo_hstep_reconstructions.png     # Stage 12 step 9's reconstruction grid (wall-approach)
 ├── media/pixel_world_model_wall_demo_hstep_rollout.png                # Stage 12 step 9's rollout grid (wall-approach)
+├── media/pixel_world_model_depth_reconstructions.png                    # Stage 12 step 10's reconstruction grid (flat-ground, depth)
+├── media/pixel_world_model_depth_rollout.png                              # Stage 12 step 10's rollout grid (flat-ground, depth)
+├── media/pixel_world_model_wall_demo_depth_reconstructions.png              # Stage 12 step 10's reconstruction grid (wall-approach, depth)
+├── media/pixel_world_model_wall_demo_depth_rollout.png                        # Stage 12 step 10's rollout grid (wall-approach, depth)
+├── media/pixel_world_model_diff_reconstructions.png                             # Stage 12 step 11's reconstruction grid (flat-ground, diff-weighted)
+├── media/pixel_world_model_diff_rollout.png                                       # Stage 12 step 11's rollout grid (flat-ground, diff-weighted)
+├── media/pixel_world_model_wall_demo_diff_reconstructions.png                        # Stage 12 step 11's reconstruction grid (wall-approach, diff-weighted)
+├── media/pixel_world_model_wall_demo_diff_rollout.png                                  # Stage 12 step 11's rollout grid (wall-approach, diff-weighted)
+├── media/pixel_world_model_wall_demo_varied_reconstructions.png                           # Stage 12 step 12's reconstruction grid
+├── media/pixel_world_model_wall_demo_varied_rollout.png                                     # Stage 12 step 12's rollout grid
 ├── requirements.txt
 └── README.md
 ```

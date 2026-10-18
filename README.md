@@ -117,7 +117,13 @@ an existing one.
     sampling properly controlled, directly observed the camera term WORKING (a real reaction
     right at the critical moment) but still insufficient alone -- a purely reactive, memory-
     less correction, exactly Stage 3's original pre-A* failure mode, now confirmed rather than
-    assumed, and the strongest case yet for actually building the global planner; see below).
+    assumed + step 19 built that exact fix (a camera-derived occupancy map feeding wam/
+    global_planner.py's A* completely unmodified) and confirmed it WORKS as a mechanism (real
+    waypoints, the robot visibly executing deliberate detour maneuvers) but still doesn't
+    improve the measured outcome -- a single coarse forward beam per replan makes the map too
+    sparse/noisy for A* to converge on one stable route (the chosen waypoint was observed
+    oscillating between routing north and south across consecutive replans), unlike lidar's
+    full sweep per scan; see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1372,6 +1378,49 @@ avoidance. This result argues FOR building step 19's global planner, with a mate
 rationale than before this investigation: local reactive tuning has been thoroughly exhausted as
 a fix, not merely assumed insufficient.
 
+### Step 19: a camera-derived occupancy map + A* -- built, working, still not enough
+
+Reuses `wam/global_planner.py`'s A* COMPLETELY UNMODIFIED (it only needs an `OccupancyGrid`
+with a `probability_map()`/`world_to_cell()`, agnostic to how it got populated) -- the only new
+code is building that grid from the camera instead of slam_sim's real ray-cast lidar. Each
+replan treats the depth frame as a single coarse forward "beam": far-depth (step 18's fix,
+each frame's own clipped maximum) becomes the beam's range, aimed along the robot's current
+world yaw -- confirmed geometrically from wam/camera.py's own mount (`xyaxes="0 -1 0 0.436 0
+0.9"`) that its horizontal look direction is exactly body-frame +x once the ~26deg downward
+pitch is projected out, so no extra yaw-offset term is needed. `navigate_wam_pixel.py` gained
+`--disable-global-planner` (reproduces step 17/18's local-only behavior exactly) and
+`--record-map` (same `slam.viz.render_frame`/`save_gif` Stage 3 already uses).
+
+Qualitatively, this clearly works AS A MECHANISM: `--verbose` traces show A* computing real,
+sensible-looking waypoints (e.g. routing south around the island via `(4.65, 1.85)`) and the
+robot visibly executing substantial, deliberate maneuvers to chase them (full reverse + full
+lateral + full turn commands), a completely different character of behavior than step 17/18's
+straight-line-until-last-second-correction pattern.
+
+But it does NOT improve the measured outcome. 5-seed test, full config (A* + reactive camera
+cost): 7.51, 7.44, 7.41, 7.57, 6.51 -- all fell, indistinguishable from every earlier
+configuration. Isolating A* alone (`--disable-pixel-cost`, dropping the reactive term) doesn't
+help either: 8.24 (timed out, barely any progress), 7.48, 7.67 (both fell) -- ruling out an
+interaction between the two camera-based terms as the cause. Re-examining the verbose trace
+explains why: the chosen waypoint **oscillates wildly between replans** -- e.g. one real
+sequence jumped `(4.65,1.85) -> (4.55,1.85) -> (4.95,1.75) -> (3.55,3.15) -> (4.05,1.35) ->
+(4.65,1.35) -> (3.35,2.85)` across consecutive 0.25s replans, alternating between routing south
+and routing further north around the island. A single coarse forward beam per replan (this
+episode's maps held only 25-100 total point updates) is simply too sparse and noisy a map
+source for A* to converge on one stable route the way lidar's full ~180-beam sweep per scan
+does -- the robot ends up chasing a constantly-relitigated plan instead of committing to one.
+
+**Honest conclusion**: the global-planner idea itself was sound and worth building (Stage 3b's
+own history correctly predicted reactive-only camera avoidance would need exactly this kind of
+fix), and the mechanism demonstrably works -- A* runs, produces real waypoints, and the robot
+visibly chases them. What's missing is map STABILITY, not the planning algorithm: a single
+narrow forward beam per replan is too thin a sensing model to feed A* a map worth committing a
+whole detour to. The most direct next fix, if this is picked up further, is a richer
+per-replan reading -- e.g. several beams spread across the camera's own ~45deg horizontal FOV
+(per-column far-depth within one frame, not just the frame-wide aggregate) -- rather than any
+further planner-side tuning (waypoint smoothing/hysteresis was considered but would only mask
+an underlying map that's genuinely too sparse to trust, not fix it).
+
 ## Repository layout
 
 ```
@@ -1429,7 +1478,8 @@ wam/
 │                                                                      #  sample_start_pose_near_corner)
 ├── navigate_wam_pixel.py                                            # Stage 12 step 17: camera-only CEM navigation (no lidar/occupancy map)
 │                                                                       # (step 18: + torch.manual_seed fix, --pixel-horizon-steps
-│                                                                       #  properly threaded, verbose pixel_cost diagnostic)
+│                                                                       #  properly threaded, verbose pixel_cost diagnostic;
+│                                                                       #  step 19: + camera-derived occupancy map, A*, --record-map)
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth

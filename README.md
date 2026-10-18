@@ -77,26 +77,30 @@ an existing one.
     term implemented, tuned, measured twice -- inconclusive, closed; see below).
 12. **Pixel-rendering mini-plan: onboard camera, a small dataset, an encoder sanity check,
     a frozen-latent dynamics check, a joint-training attempt, an isolating experiment, the
-    H-step rollout loss fix, three ways to get a stronger signal, and a usability check** --
-    DONE (camera infra + a real rendering bug found and fixed + a small autoencoder learns real
-    structure + a frozen-encoder latent dynamics model shows a weak one-step win but degrades
-    fast under rollout + joint training doesn't fix that rollout degradation on flat ground +
-    the SAME method clearly works on a deliberately easy wall-approach scenario, confirming the
-    earlier failures were about signal strength/task difficulty, not a broken method + adding
-    the H-step rollout loss (Stage 1's own fix for the same failure mode) measurably improves
-    multi-step rollout accuracy on BOTH datasets and visibly cleans up compounding noise on the
-    wall-approach data, but still can't manufacture a visually coherent rollout from flat
-    ground's inherently weak signal + training on DEPTH instead of RGB is a dramatic win where
-    there's a real distance to track (~9x over baseline, the best result in the whole
-    mini-plan) but roughly neutral on flat ground (depth there is nearly constant, not noisy)
-    + a diff-weighted loss is a null result on flat ground but a modest extra boost where
-    signal is already strong + a richer, randomized-start/speed dataset confirms the
-    wall-approach win generalizes beyond one memorized trajectory, at a smaller margin + a
-    standalone checkpoint evaluator shows every tested checkpoint already holds up to a 20-step
-    rollout with no retraining needed, though depth's huge margin shrinks substantially once
-    combined with the varied dataset -- still not usable as a planner input (no turning/multi-
-    obstacle/open-ended data, no planner integration attempted), but rollout horizon and raw
-    signal strength are no longer the blockers; see below).
+    H-step rollout loss fix, three ways to get a stronger signal, a usability check, and a
+    latent-space cost head for CEM speed** -- DONE (camera infra + a real rendering bug found
+    and fixed + a small autoencoder learns real structure + a frozen-encoder latent dynamics
+    model shows a weak one-step win but degrades fast under rollout + joint training doesn't
+    fix that rollout degradation on flat ground + the SAME method clearly works on a
+    deliberately easy wall-approach scenario, confirming the earlier failures were about signal
+    strength/task difficulty, not a broken method + adding the H-step rollout loss (Stage 1's
+    own fix for the same failure mode) measurably improves multi-step rollout accuracy on BOTH
+    datasets and visibly cleans up compounding noise on the wall-approach data, but still can't
+    manufacture a visually coherent rollout from flat ground's inherently weak signal +
+    training on DEPTH instead of RGB is a dramatic win where there's a real distance to track
+    (~9x over baseline, the best result in the whole mini-plan) but roughly neutral on flat
+    ground (depth there is nearly constant, not noisy) + a diff-weighted loss is a null result
+    on flat ground but a modest extra boost where signal is already strong + a richer,
+    randomized-start/speed dataset confirms the wall-approach win generalizes beyond one
+    memorized trajectory, at a smaller margin + a standalone checkpoint evaluator shows every
+    tested checkpoint already holds up to a 20-step rollout with no retraining needed, though
+    depth's huge margin shrinks substantially once combined with the varied dataset + a
+    latent-space cost head reads a planning-relevant cost (min-depth to nearest obstacle)
+    straight off a predicted latent with the decoder never called, staying correlated with
+    ground truth out to a 20-step rollout and scoring 1000 candidates x 15 steps **946x faster**
+    than decoding every step -- CEM-speed is no longer a blocker either, but still not usable as
+    a planner input (no turning/multi-obstacle/open-ended data, no planner integration
+    attempted); see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1162,6 +1166,46 @@ exploration, and no depth-based obstacle cost has ever been wired into the CEM p
 those remain the real next steps if this track gets picked up for actual use, not rollout
 horizon or raw signal strength (both now reasonably addressed).
 
+### Step 15: a latent-space cost head -- making pixel-WAM fast enough for CEM
+
+User asked directly: is there a way to make pixel-WAM fast enough for CEM? The dynamics
+rollout itself was never the bottleneck -- `LatentDynamics`' 32-dim latent is smaller than the
+state-based `WorldModel`'s 33-dim state, so per-candidate MLP math costs about the same either
+way. The actual cost would only come from DECODING every candidate's every predicted step back
+to a full depth image to compute something interpretable (e.g. "how close is the nearest
+point"). `wam/pixel_cost.py`'s `LatentCostHead` (same predict-a-scalar-with-built-in-
+normalization pattern as `WorldModel`/`LatentDynamics`) removes that decode step entirely:
+reads a cost straight off a latent, trained against each frame's own minimum depth value (the
+physical distance to the nearest point in view -- the same quantity `wam/planner.py`'s
+existing lidar-based obstacle cost already scores against, just sourced from a camera instead
+of a lidar scan).
+
+`train_pixel_cost.py` trains this head on top of the FROZEN step-10 depth checkpoint (wall-
+approach data), then runs three checks in increasing order of what actually matters for CEM:
+
+1. **One-step (encoded real frame)**: val MSE ~0.00000 vs. trivial baseline 0.00060, val
+   correlation 1.000 -- a near-perfect fit, though this is the easy version of the problem
+   (extracting a simple scalar statistic from an already-good encoder's latent is much easier
+   than full reconstruction or forward prediction).
+2. **Rollout (the real CEM use case)** -- read the cost off a PREDICTED latent, decoder never
+   called, H steps into an autoregressive rollout, compared against the TRUE future min-depth:
+   correlation starts at 0.97 (step 1) and degrades gradually to ~0.81-0.83 by step 20, never
+   collapsing -- a real, usable ranking signal the whole way out to the longest horizon tested
+   anywhere in this mini-plan.
+3. **Speed benchmark** (1000 candidates x 15 steps, matching realistic CEM scale): latent-only
+   cost head **6.3ms** vs. decode-every-step **5952.9ms** -- **a 946x speedup**. 6.3ms per
+   scoring pass is comfortably inside a 0.25s replan budget (CEM needs several such passes per
+   replan, across its iterative elite-refitting); ~6 seconds per pass is not.
+
+**Honest conclusion**: yes, pixel-WAM can be made fast enough for CEM -- the fix isn't a
+smaller network or fewer candidates, it's architectural: never decode inside the planning
+loop, read cost directly off the latent instead. This resolves the speed concern cleanly and
+concretely (946x, not a marginal tweak). It does NOT by itself make pixel-WAM usable --
+Step 13/14's data-diversity and planner-integration gaps are still open, and this cost head has
+only been trained against ONE target (min-depth) on ONE dataset; a real planner integration
+would still need to build a full `navigate_wam_pixel.py` around it, tested on data richer than
+one scripted wall approach.
+
 ## Repository layout
 
 ```
@@ -1180,8 +1224,9 @@ wam/
 │   ├── camera.py                  # Stage 12: onboard RGB+depth camera injection + rendering
 │   ├── pixel_encoder.py            # Stage 12: small conv autoencoder for the RGB frames
 │   │                                 # (Stage 12 step 10: + channels arg, depth_to_tensor_01)
-│   └── pixel_dynamics.py            # Stage 12 step 6: latent-space delta predictor (frozen encoder)
-│                                      # (Stage 12 step 9: + build_window_starts for H-step windows)
+│   ├── pixel_dynamics.py            # Stage 12 step 6: latent-space delta predictor (frozen encoder)
+│   │                                  # (Stage 12 step 9: + build_window_starts for H-step windows)
+│   └── pixel_cost.py                 # Stage 12 step 15: latent -> scalar cost head (no decode needed)
 ├── collect_data.py      # Stage 1: generate rollouts from the real Go2 + classical MPC
 │                            # (Stage 12: --record-pixels captures paired RGB+depth too)
 ├── train_world_model.py   # Stage 1: one-step + H-step rollout loss training
@@ -1210,6 +1255,7 @@ wam/
 ├── collect_wall_approach_demo.py                          # Stage 12 step 8: scripted wall-approach/retreat dataset
 ├── collect_wall_approach_varied_demo.py                     # Stage 12 step 12: randomized start-y/speed variant
 ├── eval_pixel_rollout.py                                      # Stage 12 step 13: per-step long-horizon checkpoint evaluator
+├── train_pixel_cost.py                                          # Stage 12 step 15: trains + verifies the latent-space cost head
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth
@@ -1230,6 +1276,7 @@ wam/
 ├── checkpoints/pixel_world_model_wall_demo_diff.pt          # Stage 12 step 11's checkpoint (wall-approach, diff-weighted)
 ├── checkpoints/pixel_world_model_wall_demo_varied.pt           # Stage 12 step 12's checkpoint (varied start/speed)
 ├── checkpoints/pixel_world_model_wall_demo_varied_depth.pt       # Stage 12 step 14's checkpoint (varied start/speed, depth)
+├── checkpoints/pixel_cost_head.pt                                  # Stage 12 step 15's LatentCostHead checkpoint
 ├── media/rollout_comparison.png  # Stage 1's verification plot
 ├── media/rollout_comparison_terrain.png  # Stage 4's verification plot (on terrain)
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo

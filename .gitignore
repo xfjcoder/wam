@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+# Stage 12 step 16: too big for GitHub's 100MB limit (221MB, 8000 transitions) -- every
+# OTHER pixel-rendering dataset committed so far stayed under 72MB; this one just has more
+# transitions. Kept locally only; regenerate with collect_wall_explore_demo.py if needed.
+data/rollouts_wall_explore.npz

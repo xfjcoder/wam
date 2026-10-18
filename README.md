@@ -77,8 +77,9 @@ an existing one.
     term implemented, tuned, measured twice -- inconclusive, closed; see below).
 12. **Pixel-rendering mini-plan: onboard camera, a small dataset, an encoder sanity check,
     a frozen-latent dynamics check, a joint-training attempt, an isolating experiment, the
-    H-step rollout loss fix, three ways to get a stronger signal, a usability check, and a
-    latent-space cost head for CEM speed** -- DONE (camera infra + a real rendering bug found
+    H-step rollout loss fix, three ways to get a stronger signal, a usability check, a
+    latent-space cost head for CEM speed, a turning-inclusive diversity dataset, and finally
+    wiring it into a real CEM planner** -- DONE (camera infra + a real rendering bug found
     and fixed + a small autoencoder learns real structure + a frozen-encoder latent dynamics
     model shows a weak one-step win but degrades fast under rollout + joint training doesn't
     fix that rollout degradation on flat ground + the SAME method clearly works on a
@@ -98,9 +99,18 @@ an existing one.
     latent-space cost head reads a planning-relevant cost (min-depth to nearest obstacle)
     straight off a predicted latent with the decoder never called, staying correlated with
     ground truth out to a 20-step rollout and scoring 1000 candidates x 15 steps **946x faster**
-    than decoding every step -- CEM-speed is no longer a blocker either, but still not usable as
-    a planner input (no turning/multi-obstacle/open-ended data, no planner integration
-    attempted); see below).
+    than decoding every step -- CEM-speed is no longer a blocker either + a genuinely
+    open-ended, turning-inclusive exploration dataset (random start pose/heading near a wall,
+    random speed/lateral/yaw_rate resampling, not a scripted straight-line approach) closes
+    the data-diversity gap, at the cost of a much weaker one-step margin (barely beats
+    baseline) and the cost head's rollout correlation collapsing far faster than the earlier
+    single-scenario result (0.80/0.53/0.35 at steps 1/2/3, not 0.97 holding to 20) + wiring the
+    cost head into wam/planner.py's CEMPlanner (a new, capped-horizon camera-only obstacle
+    term, alongside -- not replacing -- the state model's own goal/pose/stability cost) and
+    testing it in navigate_wam_pixel.py on the SAME island-routing task Stage 3 already uses:
+    a real, measurable, multi-seed win in how far it gets before failing, but not yet a full
+    navigation success -- the honest final answer to "is pixel-WAM usable" is "integrated and
+    it helps, not yet sufficient on its own"; see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1206,6 +1216,95 @@ only been trained against ONE target (min-depth) on ONE dataset; a real planner 
 would still need to build a full `navigate_wam_pixel.py` around it, tested on data richer than
 one scripted wall approach.
 
+### Step 16: closing the data-diversity gap -- turning, varied angles, open-ended exploration
+
+Every checkpoint through step 15 was trained on variations of ONE scripted scenario: drive
+straight at a wall, then straight back (step 12 varied only start position and speed, never
+lateral motion or yaw rate). `collect_wall_explore_demo.py` replaces the script with genuine
+open-ended exploration: each episode starts at a random free position AND HEADING somewhere
+near a wall in slam_sim's loop_corridor world (rejection-sampled via `World.is_free` plus a
+new `distance_to_nearest_wall` check, capped at 4m so the camera isn't just staring at empty
+flat ground), then resamples a fresh random (speed, lateral, yaw_rate) command every 0.5s --
+collect_data.py's own exploration convention, just with real walls in the scene this time and
+a start pose that puts the robot near one. Action ranges match `CEMPlanner`'s own defaults
+((-0.4, 0.8) / (-0.3, 0.3) / (-1.0, 1.0)) deliberately: the dynamics model should only have to
+generalize to the SAME action distribution a CEM planner will actually query it with. 40
+train + 10 val episodes (8s each) collected 6400/1600 transitions with **zero** early
+terminations (no falls, no wall collisions) -- the random near-wall starts and commands were
+aggressive enough for real diversity without being so aggressive they destabilized the robot.
+
+Retraining depth + H-step rollout loss (step 9/10's recipe, unchanged) on this dataset:
+val one-step MSE 0.00058 vs. baseline 0.00059 (**barely** beats it) and val 5-step rollout MSE
+0.00144 vs. baseline 0.00179 (~1.24x) -- both real but much thinner margins than the varied
+dataset's already-thinner-than-step-10 numbers (2.3x / 3.6x). This is the "more variety makes
+the problem harder" pattern from steps 12/14, now taken all the way to where the one-step
+margin is nearly gone. **Honest reading**: turning and varied-angle data is a substantially
+harder prediction problem than straight-line approach/retreat, to the point where the easy
+wins from steps 9-14 mostly don't transfer -- real signal remains (it still beats both
+baselines) but it's thin, not dramatic.
+
+Retraining the cost head (step 15's recipe, unchanged) on top of this new checkpoint surfaces
+the same pattern even more sharply in the metric that actually matters for CEM -- the
+predicted-latent rollout correlation, which held at 0.97->0.81 over 20 steps on the original
+wall-approach data, now **collapses fast**: 0.80 (step 1) -> 0.53 (step 2) -> 0.35 (step 3) ->
+0.26 (step 4) -> 0.20 (step 5) -> noise-level by step ~10 and slightly negative by step 20.
+The one-step (encoded real frame) number still looks fine (val correlation 0.928, beats
+baseline) -- it's specifically the autoregressive compounding, now compounding through a much
+harder dynamics problem, that degrades this much faster. The speed benchmark result is
+unaffected by any of this (1021x speedup, same architecture) -- speed was never the thing at
+risk here.
+
+### Step 17: wiring the cost head into an actual CEM planner (`navigate_wam_pixel.py`)
+
+`wam/planner.py`'s `CEMPlanner` gets a new optional camera-based obstacle term: `pixel_latent0`
+(the current onboard-camera depth frame, already encoded), `pixel_dynamics`/`pixel_cost_head`
+(step 15/16's frozen `LatentDynamics`/`LatentCostHead`), scored with the exact same soft-
+margin/hard-collision shape the existing lidar `obstacle_points` term already uses -- just
+reading meters off a rolled-forward latent instead of distance-to-nearest-grid-cell. This runs
+as a SEPARATE batched rollout alongside the state model's own rollout (same sampled actions,
+same horizon), not a replacement for it: the state model still owns pose/goal/stability, since
+a bare min-depth number has no (x, y) to dead-reckon a goal distance from.
+
+Because step 16 found the cost head's rollout correlation collapsing by step ~3-5, a new
+`pixel_horizon_steps` constructor arg (and matching `--pixel-horizon-steps` CLI flag, default
+3) caps how many of the planner's `horizon_steps` actually get scored by the camera term --
+scoring the full 10-step horizon with it would inject noisy, eventually anti-correlated cost
+into the later steps, actively misleading CEM rather than helping it.
+
+`navigate_wam_pixel.py` is the resulting navigator: same island-routing task
+`navigate_wam_obstacles.py` (Stage 3) already uses, but with NO lidar and NO occupancy map at
+all -- obstacle-avoidance comes entirely from the onboard camera. Deliberately a reactive,
+local-only planner (no A* global waypoint routing the way Stage 3b adds) -- the fair comparison
+point is Stage 3's ORIGINAL un-augmented local CEM, not its A*-assisted descendant.
+
+Tested goal-only (`--disable-pixel-cost`) vs. camera-aware, 3 seeds each, same start/goal
+across the island:
+
+| seed | goal-only final distance | camera-aware final distance |
+|---|---|---|
+| 0 | 7.79m (fell) | 6.96m (fell) |
+| 1 | 7.68m (fell) | 6.53m (fell) |
+| 2 | 7.61m (fell) | 5.66m (timed out, did not fall) |
+
+**Honest conclusion**: across all 3 seeds, the camera-aware planner made consistently MORE
+progress than goal-only before failing (lower final distance every time, and one run timed out
+making real progress instead of falling) -- a real, measurable, multi-seed effect from a cost
+signal sourced entirely from a camera, with the decoder never called during planning. But
+**neither configuration reached the goal** in any seed within 25s -- this is not yet a working
+navigation solution. The most likely causes, in order of how directly this mini-plan's own
+findings point at them: (1) no global planner, so a purely local reactive term can stall/loop
+at a corner exactly the way Stage 3's original design did before Stage 3b's A* fix: (2) the
+capped 3-step camera horizon is short relative to the state model's full 10-step lookahead,
+so the robot can still commit to a trajectory that only becomes visibly bad to the camera term
+a few steps later than it's acting on; (3) the underlying rollout-correlation degradation step
+16 found is a real ceiling on how much a longer camera horizon could help even if tried.
+
+This closes out the pixel-rendering mini-plan's two explicitly-open gaps from step 15: data
+diversity (step 16) and planner integration (step 17, this section) are both now DONE, with
+honest, directly-measured answers rather than assumptions -- the final state is "pixel-WAM,
+wired into a real planner, provides a real but partial benefit", not "pixel-WAM is usable" or
+"pixel-WAM doesn't work" -- neither extreme matches what was actually measured.
+
 ## Repository layout
 
 ```
@@ -1216,6 +1315,8 @@ wam/
 │   ├── model.py       # the MLP dynamics model itself (delta prediction, built-in normalization)
 │   ├── pose.py          # dead-reckon world (x, y, yaw) from the model's predicted v_body/w_body
 │   ├── planner.py         # Stage 2/3: CEM shooting planner, optional obstacle cost
+│   │                        # (Stage 12 step 17: + optional pixel_dynamics/pixel_cost_head
+│   │                        #  camera-based obstacle term, capped by pixel_horizon_steps)
 │   ├── global_planner.py    # Stage 3b: A* over the occupancy grid, feeds CEM a waypoint
 │   ├── chunked_model.py       # Stage 6: history-conditioned, action-chunked transformer
 │   ├── chunked_planner.py      # Stage 6: CEM planner shooting through the chunked model
@@ -1256,11 +1357,16 @@ wam/
 ├── collect_wall_approach_varied_demo.py                     # Stage 12 step 12: randomized start-y/speed variant
 ├── eval_pixel_rollout.py                                      # Stage 12 step 13: per-step long-horizon checkpoint evaluator
 ├── train_pixel_cost.py                                          # Stage 12 step 15: trains + verifies the latent-space cost head
+├── collect_wall_explore_demo.py                                   # Stage 12 step 16: open-ended, turning-inclusive exploration dataset
+├── navigate_wam_pixel.py                                            # Stage 12 step 17: camera-only CEM navigation (no lidar/occupancy map)
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth
 ├── data/rollouts_wall_demo.npz      # Stage 12 step 8: scripted wall-approach/retreat dataset
 ├── data/rollouts_wall_demo_varied.npz # Stage 12 step 12: randomized start-y/speed variant
+├── data/rollouts_wall_explore.npz        # Stage 12 step 16: open-ended turning-inclusive dataset
+│                                            # (221MB -- exceeds GitHub's 100MB limit, gitignored;
+│                                            #  regenerate with collect_wall_explore_demo.py)
 ├── checkpoints/world_model.pt   # Stage 1-3's checkpoint (flat-ground data only)
 ├── checkpoints/world_model_terrain.pt  # Stage 4's checkpoint (terrain-inclusive data)
 ├── checkpoints/world_model_chunked_large.pt  # Stage 6's chunked-model checkpoint
@@ -1277,6 +1383,8 @@ wam/
 ├── checkpoints/pixel_world_model_wall_demo_varied.pt           # Stage 12 step 12's checkpoint (varied start/speed)
 ├── checkpoints/pixel_world_model_wall_demo_varied_depth.pt       # Stage 12 step 14's checkpoint (varied start/speed, depth)
 ├── checkpoints/pixel_cost_head.pt                                  # Stage 12 step 15's LatentCostHead checkpoint
+├── checkpoints/pixel_world_model_wall_explore_depth.pt               # Stage 12 step 16's checkpoint (turning-inclusive, depth)
+├── checkpoints/pixel_cost_head_explore.pt                              # Stage 12 step 17's LatentCostHead checkpoint (turning-inclusive)
 ├── media/rollout_comparison.png  # Stage 1's verification plot
 ├── media/rollout_comparison_terrain.png  # Stage 4's verification plot (on terrain)
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo
@@ -1310,6 +1418,9 @@ wam/
 ├── media/pixel_world_model_wall_demo_varied_depth_reconstructions.png                          # Stage 12 step 14's reconstruction grid
 ├── media/pixel_world_model_wall_demo_varied_depth_rollout.png                                    # Stage 12 step 14's 5-step rollout grid
 ├── media/pixel_world_model_wall_demo_varied_depth_horizon20_rollout.png                             # Stage 12 step 13's 20-step rollout grid (varied+depth)
+├── media/pixel_world_model_wall_explore_depth_reconstructions.png                                      # Stage 12 step 16's reconstruction grid (turning-inclusive)
+├── media/pixel_world_model_wall_explore_depth_rollout.png                                                # Stage 12 step 16's rollout grid (turning-inclusive)
+├── media/navigate_wam_pixel_robot.gif                                                                       # Stage 12 step 17's camera-only navigation demo
 ├── requirements.txt
 └── README.md
 ```

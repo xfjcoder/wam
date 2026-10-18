@@ -42,6 +42,23 @@ making others worse, noise-level in aggregate) and too high a weight (5.0) cause
 timeout by over-committing to a bad action -- see README Stage 11 for the full measured
 result. Kept available (default 0.0, a no-op) as verified infrastructure, not adopted.
 
+Pixel-rendering mini-plan, step 17 adds an optional CAMERA-based obstacle term: instead of
+(or alongside) the lidar-built `obstacle_points` grid above, `plan()` accepts a `pixel_latent0`
+(the onboard camera's current depth frame, already encoded via wam/pixel_encoder.py's
+ConvAutoencoder) plus a `pixel_dynamics`/`pixel_cost_head` pair (wam/pixel_dynamics.py's
+LatentDynamics and wam/pixel_cost.py's LatentCostHead from step 15, both frozen, trained on
+step 16's turning-inclusive exploration data). Each rollout step reads a predicted
+minimum-depth (distance to the nearest point the camera sees) straight off the PIXEL
+dynamics' own rolled-forward latent -- the decoder is never called, exactly step 15's speed
+fix -- and penalizes it with the same soft-margin/hard-collision shape the lidar term uses,
+just in physical meters read from a camera instead of grid cells read from a lidar scan. This
+runs as a SEPARATE batched rollout alongside the state-based model's own rollout (same
+`samples` actions, same horizon, same n_samples -- just a second, independent latent being
+advanced every step), not a replacement for it: the state model still owns pose/goal/
+stability, since (unlike the lidar term) a bare min-depth number carries no (x, y) position
+to dead-reckon a goal distance from -- see README's pixel-vs-state comparison for why this
+split plays to each model's own strength rather than forcing one to do both jobs.
+
 Needs torch (see repo's own venv note in requirements.txt).
 """
 from dataclasses import dataclass
@@ -74,8 +91,26 @@ class CEMPlanner:
                  w_dist: float = 1.0, w_heading: float = 0.3, w_stability: float = 3.0,
                  w_obstacle: float = 40.0, w_collision: float = 200.0,
                  safety_margin: float = 0.5, collision_margin: float = 0.35,
-                 w_smooth: float = 0.0):
+                 w_smooth: float = 0.0,
+                 pixel_dynamics=None, pixel_cost_head=None,
+                 w_pixel_obstacle: float = 40.0, w_pixel_collision: float = 200.0,
+                 pixel_safety_margin: float = 0.6, pixel_collision_margin: float = 0.35,
+                 pixel_horizon_steps=None):
         self.model = model
+        self.pixel_dynamics = pixel_dynamics
+        self.pixel_cost_head = pixel_cost_head
+        self.w_pixel_obstacle = w_pixel_obstacle
+        self.w_pixel_collision = w_pixel_collision
+        self.pixel_safety_margin = pixel_safety_margin
+        self.pixel_collision_margin = pixel_collision_margin
+        # Step 17's own train_pixel_cost.py rollout check (over turning-inclusive data) found
+        # the cost head's predicted-latent correlation collapsing much faster than step 15's
+        # single-scenario result did -- 0.80/0.53/0.35 at steps 1/2/3, near-zero by ~10 -- so
+        # scoring every one of horizon_steps's steps with it would inject noisy/anti-correlated
+        # cost at the later ones. Defaults to horizon_steps (score everything, step 15's
+        # original behavior) but navigate_wam_pixel.py caps it lower based on that finding.
+        self.pixel_horizon_steps = (pixel_horizon_steps if pixel_horizon_steps is not None
+                                    else horizon_steps)
         self.lo = torch.tensor([speed_range[0], lateral_range[0], yaw_rate_range[0]])
         self.hi = torch.tensor([speed_range[1], lateral_range[1], yaw_rate_range[1]])
         self.horizon_steps = horizon_steps
@@ -100,7 +135,8 @@ class CEMPlanner:
 
     @torch.no_grad()
     def plan(self, state, pose, goal_xy, warm_start=None, obstacle_points=None,
-             dynamic_obstacles=None, dynamic_obstacle_radius: float = 0.0) -> PlanResult:
+             dynamic_obstacles=None, dynamic_obstacle_radius: float = 0.0,
+             pixel_latent0=None) -> PlanResult:
         """state: (STATE_DIM,) current real state. pose: (x, y, yaw) current real pose
         (ground truth -- only the planner's internal ROLLOUT dead-reckons with the model;
         the state it starts from is always the real, measured one). goal_xy: (gx, gy).
@@ -119,7 +155,10 @@ class CEMPlanner:
         few recently-vacated cells near a moving obstacle stay marked occupied for a few
         scans), but a single extrapolated point has no such built-in slack, so collapsing a
         sensed cluster down to its centroid without this would silently shrink the avoided
-        region from the real object's full width down to a bare point."""
+        region from the real object's full width down to a bare point. pixel_latent0: optional
+        (latent_dim,) encoded onboard-camera depth frame (step 17) -- None (default) recovers
+        exactly the lidar-only behavior above; requires pixel_dynamics/pixel_cost_head to have
+        been passed to the constructor, otherwise it's silently ignored (use_pixel stays False)."""
         state0 = torch.as_tensor(state, dtype=torch.float32)
         x0, y0, yaw0 = (torch.as_tensor(v, dtype=torch.float32) for v in pose)
         gx, gy = goal_xy
@@ -138,6 +177,10 @@ class CEMPlanner:
         mean = prev_action if prev_action is not None else torch.zeros(3)
         std = (self.hi - self.lo) / 4.0
 
+        use_pixel = (self.pixel_dynamics is not None and self.pixel_cost_head is not None
+                     and pixel_latent0 is not None)
+        z0 = torch.as_tensor(pixel_latent0, dtype=torch.float32) if use_pixel else None
+
         best_cost, best_xy = float("inf"), (x0.item(), y0.item())
         for _ in range(self.n_iters):
             samples = mean + std * torch.randn(self.n_samples, 3)
@@ -148,6 +191,7 @@ class CEMPlanner:
             y_b = y0.expand(self.n_samples).clone()
             yaw_b = yaw0.expand(self.n_samples).clone()
             cost = torch.zeros(self.n_samples)
+            z_b = z0.unsqueeze(0).expand(self.n_samples, -1).clone() if use_pixel else None
 
             for h in range(self.horizon_steps):
                 state_b = self.model(state_b, samples)
@@ -176,6 +220,13 @@ class CEMPlanner:
                     soft = torch.clamp(dyn_safety - dyn_dist, min=0.0) ** 2
                     hard = (dyn_dist < dyn_collision).float()
                     cost = cost + self.w_obstacle * soft + self.w_collision * hard
+
+                if use_pixel and h < self.pixel_horizon_steps:
+                    z_b = self.pixel_dynamics(z_b, samples)
+                    pred_min_depth = self.pixel_cost_head(z_b).squeeze(1)
+                    soft = torch.clamp(self.pixel_safety_margin - pred_min_depth, min=0.0) ** 2
+                    hard = (pred_min_depth < self.pixel_collision_margin).float()
+                    cost = cost + self.w_pixel_obstacle * soft + self.w_pixel_collision * hard
 
             dist = torch.hypot(gx - x_b, gy - y_b)
             heading_err = torch.atan2(gy - y_b, gx - x_b) - yaw_b

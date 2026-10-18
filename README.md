@@ -1460,6 +1460,11 @@ trace, `pixel_cost` stays at 0.00 for the entire episode, and the fall happens w
 skirting tight along the island's southern edge under a sharp commanded turn, chasing an
 A*-planned waypoint, not reacting to a last-second camera reading.
 
+`media/navigate_wam_pixel_step20_robot.gif` (third-person view) and
+`media/navigate_wam_pixel_step20_map.gif` (the camera-derived occupancy map + A* path, same
+`--record-map` visualization step 19 introduced) capture this exact seed-2 run end to end,
+including the fall near the island's southern edge.
+
 **Honest conclusion**: denser sensing was the right next experiment to run -- it directly,
 measurably fixed the specific mechanism step 19 diagnosed (map sparsity causing waypoint
 oscillation) without touching the planner -- but map stability turns out to be necessary, not
@@ -1610,6 +1615,8 @@ wam/
 ├── media/navigate_wam_pixel_robot.gif                                                                       # Stage 12 step 17's camera-only navigation demo
 ├── media/pixel_world_model_wall_explore_corners_depth_reconstructions.png                                    # Stage 12 step 18's reconstruction grid (corner-biased)
 ├── media/pixel_world_model_wall_explore_corners_depth_rollout.png                                              # Stage 12 step 18's rollout grid (corner-biased)
+├── media/navigate_wam_pixel_step20_robot.gif                                                                     # Stage 12 step 20's camera-only + A* + multi-beam navigation demo
+├── media/navigate_wam_pixel_step20_map.gif                                                                         # Stage 12 step 20's camera-derived occupancy map + A* path, same run
 ├── requirements.txt
 └── README.md
 ```

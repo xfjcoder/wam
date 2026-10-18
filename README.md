@@ -107,10 +107,17 @@ an existing one.
     single-scenario result (0.80/0.53/0.35 at steps 1/2/3, not 0.97 holding to 20) + wiring the
     cost head into wam/planner.py's CEMPlanner (a new, capped-horizon camera-only obstacle
     term, alongside -- not replacing -- the state model's own goal/pose/stability cost) and
-    testing it in navigate_wam_pixel.py on the SAME island-routing task Stage 3 already uses:
-    a real, measurable, multi-seed win in how far it gets before failing, but not yet a full
-    navigation success -- the honest final answer to "is pixel-WAM usable" is "integrated and
-    it helps, not yet sufficient on its own"; see below).
+    testing it in navigate_wam_pixel.py on the SAME island-routing task Stage 3 already uses +
+    step 18 found and fixed a real bug (CEMPlanner's torch sampling was never seeded, so the
+    step 17 comparison above partly measured CEM noise, not a real effect -- corrected), tried
+    a corner-biased dataset (a NEGATIVE result -- made the dynamics model fit worse, not
+    better), retargeted the cost head from a near-collision-only signal to a genuine
+    multi-meter one (step 15-17's "min-depth" was mostly the camera's own near-field ground-
+    plane reading; "far-depth" tracks wall distance smoothly from 3.62m down), and, with CEM's
+    sampling properly controlled, directly observed the camera term WORKING (a real reaction
+    right at the critical moment) but still insufficient alone -- a purely reactive, memory-
+    less correction, exactly Stage 3's original pre-A* failure mode, now confirmed rather than
+    assumed, and the strongest case yet for actually building the global planner; see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1286,24 +1293,84 @@ across the island:
 | 1 | 7.68m (fell) | 6.53m (fell) |
 | 2 | 7.61m (fell) | 5.66m (timed out, did not fall) |
 
-**Honest conclusion**: across all 3 seeds, the camera-aware planner made consistently MORE
-progress than goal-only before failing (lower final distance every time, and one run timed out
-making real progress instead of falling) -- a real, measurable, multi-seed effect from a cost
-signal sourced entirely from a camera, with the decoder never called during planning. But
-**neither configuration reached the goal** in any seed within 25s -- this is not yet a working
-navigation solution. The most likely causes, in order of how directly this mini-plan's own
-findings point at them: (1) no global planner, so a purely local reactive term can stall/loop
-at a corner exactly the way Stage 3's original design did before Stage 3b's A* fix: (2) the
-capped 3-step camera horizon is short relative to the state model's full 10-step lookahead,
-so the robot can still commit to a trajectory that only becomes visibly bad to the camera term
-a few steps later than it's acting on; (3) the underlying rollout-correlation degradation step
-16 found is a real ceiling on how much a longer camera horizon could help even if tried.
+**This table's "measurable win" claim was WRONG -- corrected in step 18 below.** The cause
+was a real bug, not a modeling issue: `navigate_wam_pixel.py` never seeded torch's RNG, so
+`CEMPlanner`'s own candidate sampling was uncontrolled and re-running the identical `--seed`
+produced DIFFERENT outcomes (confirmed directly: the same seed gave 5.66m in one run and
+4.46m in another). The 3-seed table above was measuring CEM sampling noise at least as much
+as any real effect of the camera cost term. See step 18 for the corrected, reproducible
+comparison and what the camera cost term actually does.
 
-This closes out the pixel-rendering mini-plan's two explicitly-open gaps from step 15: data
-diversity (step 16) and planner integration (step 17, this section) are both now DONE, with
-honest, directly-measured answers rather than assumptions -- the final state is "pixel-WAM,
-wired into a real planner, provides a real but partial benefit", not "pixel-WAM is usable" or
-"pixel-WAM doesn't work" -- neither extreme matches what was actually measured.
+### Step 18: a corrected comparison, a root-cause diagnosis, and a necessary correction
+
+User asked to try two more things: collect more exploration data concentrated near the
+island's corners (where a local-only planner most plausibly stalls), then build a global
+planner for the camera-only path. Doing the first turned up the seeding bug above while
+building the comparison this step needed, and a second finding changed the plan before the
+global planner was built -- both are reported here in full, not smoothed over.
+
+**Corner-biased data (`collect_wall_explore_demo.py --corner-bias`)**: adds `island_corners`/
+`sample_start_pose_near_corner` -- with probability `--corner-bias`, an episode starts within
+`--corner-radius` of one of the island's own 4 corners instead of anywhere near-wall. Collected
+8000/1684 train/val transitions (`--corner-bias 0.6`, 221MB->280MB, also gitignored). Retraining
+depth + H-step rollout loss on it was a **negative result**: val one-step MSE 0.00186 vs.
+baseline 0.00162 -- for the first time in this mini-plan, one-step prediction DOES NOT beat
+baseline at all (5-step rollout still does, 0.00329 vs 0.00400, ~1.21x, but barely). Corner-
+heavy data is harder for the dynamics model to fit than step 16's general near-wall data, not
+easier -- the opposite of what collecting it was meant to achieve.
+
+**Finding the seeding bug**: a proper 3-seed comparison needs CEM's OWN sampling controlled,
+not just the environment's. Adding `torch.manual_seed(args.seed)` to `navigate_wam_pixel.py`
+made runs fully reproducible (verified: identical `--seed` now gives byte-identical results).
+Re-running the comparison properly (5 seeds, 25s each) tells a very different story:
+
+| config | 5-seed final distances (all fell unless noted) |
+|---|---|
+| goal-only (no camera) | 7.76, 7.80, 7.75, 7.74, 7.62 |
+| min-depth, step 16 dynamics, horizon 3 (step 17's exact original config) | 4.55, 7.94, 6.98, 4.90 (timed out), 7.00 |
+| far-depth, corner-biased dynamics, horizon 8 | 7.37, 7.81, 7.74, 7.79, 7.77 |
+| far-depth, step 16 dynamics, horizon 20 | 7.46, 7.66, 7.50, 7.86, 7.21 |
+
+With CEM's sampling actually controlled, step 17's own exact configuration shows a REAL but
+INCONSISTENT effect (2/5 seeds much better, 3/5 indistinguishable from baseline) -- not the
+clean sweep the uncontrolled 3-seed table suggested. Neither the corner-biased dynamics nor a
+longer camera horizon recovers a reliable win.
+
+**A second finding, independent of the bug**: while designing step 19's occupancy map, checking
+what "min-depth" (the step 15-17 cost target) actually measures turned up that it's dominated
+by the camera's own near-field GROUND-PLANE intersection (~0.20-0.36m, confirmed near-constant
+regardless of wall distance on both the flat-ground AND wall-approach datasets) -- it only dips
+below that floor baseline in the last ~10cm before contact, making it a near-collision reflex,
+not a several-meter "how far is the wall" signal. `check_onboard_camera.py`'s ORIGINAL sanity
+check had already used the RIGHT statistic for that job and called it "far-depth" (each frame's
+own MAXIMUM depth, clipped) -- confirmed smoothly tracking wall distance from 3.62m down to
+0.37m on the wall-demo data. `train_pixel_cost.py` gained a `--target {min,far}` option; the
+far-depth cost head is a dramatically better OPEN-LOOP signal (rollout correlation 0.98->0.57
+over 20 steps vs. min-depth's collapse to near-zero by step 10, even on the harder corner data).
+
+**But it still didn't close the gap in closed-loop testing** (the table above). Added
+per-replan diagnostic logging (`PlanResult.pixel_cost`, the chosen action's own camera-cost
+contribution) to find out why, and watched it directly: with a short horizon the camera term
+almost never activates at all (predicted far-depth rarely drops below the safety margin within
+the ~0.3m of travel an 8-step/0.4s lookahead covers); with a long horizon (20 steps) it DOES
+engage -- caught it directly, `pixel_cost` spiking to 1.66 and the chosen action changing
+substantially right as a wall got close -- but the robot still fell a few seconds later at a
+similar final distance. **Root cause, now directly observed rather than assumed**: the camera
+term is a real, working, purely REACTIVE correction with no persistent memory -- it slows down
+and swerves right at the critical moment, then immediately resumes charging the goal once the
+moment passes, with nothing remembering "there's a wall over there, go around it". This is
+exactly Stage 3's original pre-A* corner-stall failure mode, now confirmed directly for the
+camera-only case (every lever that could fix a SIGNAL-quality problem -- target choice, horizon
+length, which dynamics checkpoint -- was tried and ruled out) rather than inferred from Stage
+3's history alone.
+
+**Honest conclusion, correcting step 17**: the "measurable, multi-seed win" claimed above was
+real sampling noise, not (mostly) a real effect -- a genuine mistake, corrected here rather than
+left standing. What IS real: a working camera-based reactive correction that measurably engages
+at the right moment but, being memory-less, cannot by itself produce reliable route-level
+avoidance. This result argues FOR building step 19's global planner, with a materially stronger
+rationale than before this investigation: local reactive tuning has been thoroughly exhausted as
+a fix, not merely assumed insufficient.
 
 ## Repository layout
 
@@ -1358,7 +1425,11 @@ wam/
 ├── eval_pixel_rollout.py                                      # Stage 12 step 13: per-step long-horizon checkpoint evaluator
 ├── train_pixel_cost.py                                          # Stage 12 step 15: trains + verifies the latent-space cost head
 ├── collect_wall_explore_demo.py                                   # Stage 12 step 16: open-ended, turning-inclusive exploration dataset
+│                                                                      # (step 18: + --corner-bias, island_corners,
+│                                                                      #  sample_start_pose_near_corner)
 ├── navigate_wam_pixel.py                                            # Stage 12 step 17: camera-only CEM navigation (no lidar/occupancy map)
+│                                                                       # (step 18: + torch.manual_seed fix, --pixel-horizon-steps
+│                                                                       #  properly threaded, verbose pixel_cost diagnostic)
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth
@@ -1367,6 +1438,9 @@ wam/
 ├── data/rollouts_wall_explore.npz        # Stage 12 step 16: open-ended turning-inclusive dataset
 │                                            # (221MB -- exceeds GitHub's 100MB limit, gitignored;
 │                                            #  regenerate with collect_wall_explore_demo.py)
+├── data/rollouts_wall_explore_corners.npz  # Stage 12 step 18: corner-biased variant (--corner-bias 0.6)
+│                                              # (280MB, gitignored -- made the dynamics model FIT
+│                                              #  WORSE, a negative result; regenerate if needed)
 ├── checkpoints/world_model.pt   # Stage 1-3's checkpoint (flat-ground data only)
 ├── checkpoints/world_model_terrain.pt  # Stage 4's checkpoint (terrain-inclusive data)
 ├── checkpoints/world_model_chunked_large.pt  # Stage 6's chunked-model checkpoint
@@ -1384,7 +1458,17 @@ wam/
 ├── checkpoints/pixel_world_model_wall_demo_varied_depth.pt       # Stage 12 step 14's checkpoint (varied start/speed, depth)
 ├── checkpoints/pixel_cost_head.pt                                  # Stage 12 step 15's LatentCostHead checkpoint
 ├── checkpoints/pixel_world_model_wall_explore_depth.pt               # Stage 12 step 16's checkpoint (turning-inclusive, depth)
-├── checkpoints/pixel_cost_head_explore.pt                              # Stage 12 step 17's LatentCostHead checkpoint (turning-inclusive)
+│                                                                        # -- step 18 found this is the BEST available dynamics
+│                                                                        #    checkpoint (beats the corner-biased one below)
+├── checkpoints/pixel_cost_head_explore.pt                              # Stage 12 step 17's LatentCostHead checkpoint (turning-inclusive,
+│                                                                          # min-depth target -- step 18 found this target is mostly a
+│                                                                          # near-collision reflex; see pixel_cost_head_explore_far.pt)
+├── checkpoints/pixel_cost_head_explore_far.pt                            # Stage 12 step 18: far-depth target on the BEST dynamics
+│                                                                            # checkpoint -- the best-performing cost head so far
+├── checkpoints/pixel_world_model_wall_explore_corners_depth.pt             # Stage 12 step 18's corner-biased dynamics checkpoint
+│                                                                             # (negative result: one-step prediction does NOT beat baseline)
+├── checkpoints/pixel_cost_head_corners_far.pt                                # Stage 12 step 18: far-depth target on the corner-biased
+│                                                                               # checkpoint (worse than pixel_cost_head_explore_far.pt)
 ├── media/rollout_comparison.png  # Stage 1's verification plot
 ├── media/rollout_comparison_terrain.png  # Stage 4's verification plot (on terrain)
 ├── media/navigate_wam_demo.gif    # Stage 2's planner-driven navigation demo
@@ -1421,6 +1505,8 @@ wam/
 ├── media/pixel_world_model_wall_explore_depth_reconstructions.png                                      # Stage 12 step 16's reconstruction grid (turning-inclusive)
 ├── media/pixel_world_model_wall_explore_depth_rollout.png                                                # Stage 12 step 16's rollout grid (turning-inclusive)
 ├── media/navigate_wam_pixel_robot.gif                                                                       # Stage 12 step 17's camera-only navigation demo
+├── media/pixel_world_model_wall_explore_corners_depth_reconstructions.png                                    # Stage 12 step 18's reconstruction grid (corner-biased)
+├── media/pixel_world_model_wall_explore_corners_depth_rollout.png                                              # Stage 12 step 18's rollout grid (corner-biased)
 ├── requirements.txt
 └── README.md
 ```

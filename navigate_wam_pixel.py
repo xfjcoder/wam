@@ -117,6 +117,13 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
+    # CEMPlanner's own candidate sampling (torch.randn) was never seeded anywhere in this
+    # project -- confirmed directly: re-running an identical --seed produced a DIFFERENT
+    # final distance. --seed only controlled env/numpy randomness. Without this, a 3-seed
+    # comparison partly measures CEM sampling noise, not the configuration being tested.
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model = WorldModel(STATE_DIM, ACTION_DIM, hidden=ckpt["hidden"], n_hidden=ckpt["n_hidden"])
     model.load_state_dict(ckpt["model_state"])
@@ -224,7 +231,8 @@ def main():
             target_action = result.action.numpy()
             if args.verbose:
                 print(f"  t={step/200.0:5.1f}s pos=({x:+.2f},{y:+.2f}) yaw={yaw:+.2f} "
-                      f"dist={dist:.2f} action={target_action} cost={result.cost:.2f}")
+                      f"dist={dist:.2f} action={target_action} cost={result.cost:.2f} "
+                      f"pixel_cost={result.pixel_cost:.2f}")
 
         cur_fwd += np.clip(target_action[0] - cur_fwd, -max_cmd_delta, max_cmd_delta)
         cur_lat += np.clip(target_action[1] - cur_lat, -max_cmd_delta, max_cmd_delta)

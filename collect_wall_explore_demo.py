@@ -27,10 +27,22 @@ injected walls are real MuJoCo geoms, not a non-colliding sim) just terminates t
 early, same as a fall -- collect_episode discards the incomplete macro-step and moves on,
 identical to collect_data.py's/collect_wall_approach_demo.py's own handling.
 
+Step 18 adds `--corner-bias`: with that probability, an episode starts near one of the
+island's own 4 corners (`island_corners`/`sample_start_pose_near_corner`) instead of anywhere
+near-wall. Motivated directly by step 17's `navigate_wam_pixel.py` result -- a camera-only
+local planner most plausibly stalls trying to coordinate an actual TURN around a corner, not
+tracking a wall band growing/shrinking head-on the way the original approach/retreat scenario
+(and most of step 16's general near-wall sampling) trained on. 0.0 (default) reproduces step
+16's exact behavior.
+
 Usage (needs go1_rl_walk/mpc's own venv for mujoco/torch, and slam_sim importable as a
 sibling repo):
     /home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 collect_wall_explore_demo.py \
         --episodes 40 --val-episodes 10 --out data/rollouts_wall_explore.npz
+    # step 18, corner-focused:
+    /home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3 collect_wall_explore_demo.py \
+        --episodes 50 --val-episodes 12 --corner-bias 0.6 \
+        --out data/rollouts_wall_explore_corners.npz
 """
 import argparse
 import os
@@ -102,6 +114,30 @@ def sample_start_pose(world: World, rng, margin: float, max_wall_distance: float
     raise RuntimeError("could not sample a valid near-wall start pose in 200 tries")
 
 
+def island_corners(world: World):
+    """The island's own 4 corners -- same axis-aligned-layout assumption
+    distance_to_nearest_wall/World.is_free already make. These are where
+    navigate_wam_pixel.py's step 17 eval most likely stalled: a camera-only local planner
+    has to coordinate a real TURN around one of these, not just track a shrinking/growing
+    wall band head-on the way the original wall-approach scenario trained on."""
+    island = world.walls[4:8]
+    ix1, iy1 = island[0, 0], island[0, 1]
+    ix2, iy2 = island[1, 2], island[2, 3]
+    return [(ix1, iy1), (ix2, iy1), (ix2, iy2), (ix1, iy2)]
+
+
+def sample_start_pose_near_corner(world: World, rng, margin: float, corner_radius: float):
+    corners = island_corners(world)
+    cx, cy = corners[int(rng.integers(0, len(corners)))]
+    for _ in range(200):
+        x = cx + float(rng.uniform(-corner_radius, corner_radius))
+        y = cy + float(rng.uniform(-corner_radius, corner_radius))
+        if world.is_free(x, y, margin=margin):
+            yaw = float(rng.uniform(-np.pi, np.pi))
+            return x, y, yaw
+    raise RuntimeError("could not sample a valid near-corner start pose in 200 tries")
+
+
 def teleport(env, x: float, y: float, yaw: float):
     data = env.mujoco_go2.data
     data.qpos[0] = x
@@ -114,11 +150,19 @@ def teleport(env, x: float, y: float, yaw: float):
 
 
 def collect_episode(env, cam, world, rng, episode_seconds, hold_ticks, macro_k,
-                     start_margin, max_wall_distance, max_accel=1.5, max_yaw_accel=3.0):
+                     start_margin, max_wall_distance, corner_bias=0.0, corner_radius=1.5,
+                     max_accel=1.5, max_yaw_accel=3.0):
     """Same resampling-loop shape as collect_data.py's collect_episode, PLUS a random
-    near-wall start pose/heading each episode -- the actual data-diversity fix."""
+    near-wall start pose/heading each episode -- the actual data-diversity fix. With
+    probability `corner_bias`, starts near one of the island's own corners instead of
+    anywhere near-wall (step 18: the camera-only planner most likely stalls coordinating a
+    real turn around a corner, not tracking a wall band head-on -- more data of exactly
+    that situation is the cheap thing to try before a bigger global-planner fix)."""
     obs, _ = env.reset(seed=int(rng.integers(0, 2**31 - 1)))
-    x0, y0, yaw0 = sample_start_pose(world, rng, start_margin, max_wall_distance)
+    if corner_bias > 0 and rng.random() < corner_bias:
+        x0, y0, yaw0 = sample_start_pose_near_corner(world, rng, start_margin, corner_radius)
+    else:
+        x0, y0, yaw0 = sample_start_pose(world, rng, start_margin, max_wall_distance)
     teleport(env, x0, y0, yaw0)
 
     max_ticks = int(episode_seconds * 200)
@@ -194,6 +238,12 @@ def main():
                           "the camera's depth channel informative (steps 1-7 found open flat "
                           "ground gives it almost nothing to predict).")
     ap.add_argument("--pixel-resolution", type=int, default=64)
+    ap.add_argument("--corner-bias", type=float, default=0.0,
+                     help="probability an episode starts near one of the island's own "
+                          "corners instead of anywhere near-wall (step 18).")
+    ap.add_argument("--corner-radius", type=float, default=1.5,
+                     help="episode start is sampled within this many meters of the chosen "
+                          "corner (box-uniform, then rejected if not free).")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=str, default="data/rollouts_wall_explore.npz")
     args = ap.parse_args()
@@ -215,7 +265,8 @@ def main():
         for ep in range(n):
             s, a, ns, rgb, depth = collect_episode(
                 env, cam, world, rng, args.episode_seconds, args.hold_ticks, args.macro_k,
-                args.start_margin, args.max_wall_distance)
+                args.start_margin, args.max_wall_distance,
+                corner_bias=args.corner_bias, corner_radius=args.corner_radius)
             if len(s) * args.macro_k < 0.9 * args.episode_seconds * 200:
                 n_fell += 1
             all_s.append(s); all_a.append(a); all_ns.append(ns)

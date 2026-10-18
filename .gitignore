@@ -4,3 +4,5 @@ __pycache__/
 # OTHER pixel-rendering dataset committed so far stayed under 72MB; this one just has more
 # transitions. Kept locally only; regenerate with collect_wall_explore_demo.py if needed.
 data/rollouts_wall_explore.npz
+# Stage 12 step 18: same reason, bigger still (280MB)
+data/rollouts_wall_explore_corners.npz

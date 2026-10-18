@@ -82,6 +82,8 @@ class PlanResult:
     action: torch.Tensor          # (3,) best constant command found
     cost: float                   # its predicted cost
     pred_final_xy: tuple          # where the model predicts this command ends up
+    pixel_cost: float = 0.0       # step 19 diagnostics: the chosen action's own camera-cost
+                                   # contribution (0 if pixel cost wasn't enabled this call)
 
 
 class CEMPlanner:
@@ -191,6 +193,7 @@ class CEMPlanner:
             y_b = y0.expand(self.n_samples).clone()
             yaw_b = yaw0.expand(self.n_samples).clone()
             cost = torch.zeros(self.n_samples)
+            pixel_cost = torch.zeros(self.n_samples)
             z_b = z0.unsqueeze(0).expand(self.n_samples, -1).clone() if use_pixel else None
 
             for h in range(self.horizon_steps):
@@ -226,7 +229,9 @@ class CEMPlanner:
                     pred_min_depth = self.pixel_cost_head(z_b).squeeze(1)
                     soft = torch.clamp(self.pixel_safety_margin - pred_min_depth, min=0.0) ** 2
                     hard = (pred_min_depth < self.pixel_collision_margin).float()
-                    cost = cost + self.w_pixel_obstacle * soft + self.w_pixel_collision * hard
+                    step_pixel_cost = self.w_pixel_obstacle * soft + self.w_pixel_collision * hard
+                    cost = cost + step_pixel_cost
+                    pixel_cost = pixel_cost + step_pixel_cost
 
             dist = torch.hypot(gx - x_b, gy - y_b)
             heading_err = torch.atan2(gy - y_b, gx - x_b) - yaw_b
@@ -245,5 +250,7 @@ class CEMPlanner:
             if cost[iter_best] < best_cost:
                 best_cost = float(cost[iter_best])
                 best_xy = (float(x_b[iter_best]), float(y_b[iter_best]))
+                best_pixel_cost = float(pixel_cost[iter_best]) if use_pixel else 0.0
 
-        return PlanResult(action=mean, cost=best_cost, pred_final_xy=best_xy)
+        return PlanResult(action=mean, cost=best_cost, pred_final_xy=best_xy,
+                           pixel_cost=best_pixel_cost)

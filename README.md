@@ -79,7 +79,7 @@ an existing one.
     a frozen-latent dynamics check, a joint-training attempt, an isolating experiment, the
     H-step rollout loss fix, three ways to get a stronger signal, a usability check, a
     latent-space cost head for CEM speed, a turning-inclusive diversity dataset, and finally
-    wiring it into a real CEM planner** -- DONE (camera infra + a real rendering bug found
+    wiring it into a real CEM planner** -- DONE AND CLOSED (camera infra + a real rendering bug found
     and fixed + a small autoencoder learns real structure + a frozen-encoder latent dynamics
     model shows a weak one-step win but degrades fast under rollout + joint training doesn't
     fix that rollout degradation on flat ground + the SAME method clearly works on a
@@ -128,7 +128,10 @@ an existing one.
     replace near-every-replan flip-flopping) but STILL doesn't fix the outcome -- all seeds
     still fall or time out, at comparable final distances to step 19, with the camera reactive
     term often not even engaging on the run that fails -- map sparsity was A real contributor,
-    not THE whole story; see below).
+    not THE whole story -- closed here: steps 17-20 tried and resolved seeding, cost-head
+    target, corner-biased data, global planning, and sensing density in turn, without ever
+    moving the headline navigation outcome, a reasonable stopping point absent a genuinely new
+    hypothesis; see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1477,6 +1480,37 @@ steps 17-20 have now tried and fixed/ruled out seeding, cost-head target, corner
 global planning, and sensing density in turn, with the headline navigation outcome essentially
 flat across all of them, this is a reasonable natural stopping point for the mini-plan unless a
 specific further hypothesis is worth testing.
+
+### Mini-plan closed: overall summary
+
+Twenty steps, closed here (user: "let's close out the mini-plan here"). The honest final state:
+
+- **Camera infra (steps 1-4) is solid and reusable**: a verified onboard RGB+depth mount, a
+  real rendering-group bug found and fixed, pixel capture wired into data collection.
+- **A depth-based latent dynamics model + cost head (steps 5-15) genuinely works as
+  perception**: trained fast, holds up to long rollouts with no retraining needed, is fast
+  enough for CEM (946x speedup over decoding every candidate step), and its predicted cost
+  tracks real wall distance smoothly out to 20 steps once targeted at the right statistic
+  (far-depth, step 18) -- none of signal strength, rollout horizon, or planning-loop speed
+  turned out to be the blocker they looked like at various points.
+- **Closed-loop navigation (steps 16-20) never closed the gap to a usable result**, despite
+  trying every mechanism that looked plausible in turn: a diversity-fixing dataset (step 16,
+  made prediction harder but still usable), properly-seeded multi-seed evaluation (step 18,
+  caught a real bug), the correct cost target (step 18), a global planner to fix the reactive
+  term's lack of memory (step 19, works as a mechanism), and denser per-replan sensing to fix
+  the global planner's map sparsity (step 20, also works as intended). Each fix measurably did
+  what it was supposed to do; none of them moved the final navigation outcome, which stayed at
+  "robot falls or times out before reaching the goal" throughout.
+- **What this leaves open, if picked up again**: the remaining failures look like close-
+  quarters maneuvering/control accuracy near the island's corners, not a perception or mapping
+  defect -- a genuinely different problem (trajectory tracking, or tighter CEM safety margins
+  specifically around A* waypoints) than this mini-plan's camera-perception chain addresses.
+  Re-proposing another sensing-density or mapping tweak without that different hypothesis in
+  hand would just be re-running an already-closed experiment.
+
+Best checkpoints if this track is ever revisited: `pixel_world_model_wall_explore_depth.pt`
+(dynamics, step 16) + `pixel_cost_head_explore_far.pt` (cost head, step 18, far-depth target),
+with `navigate_wam_pixel.py --n-beams 7` (step 20, the default) for the occupancy map.
 
 ## Repository layout
 

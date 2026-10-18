@@ -25,16 +25,22 @@ original pre-A* corner-stall failure mode, now observed rather than assumed.
 Step 19 fixes that the same way Stage 3b fixed it for lidar: a coarse occupancy map built
 from the camera (instead of slam_sim's real ray-cast lidar), feeding the SAME `wam/
 global_planner.py` A* unmodified (it's agnostic to how its `OccupancyGrid` got populated).
-Each replan treats the depth frame as a single coarse forward "beam": far-depth (each frame's
-own clipped MAXIMUM depth -- step 18 found this is a genuine multi-meter signal, unlike
-min-depth) becomes the beam's range, aimed along the robot's current world yaw (confirmed
-geometrically in wam/camera.py's own mount: the camera's horizontal look direction is exactly
-body-frame +x, no lateral mount bias once pitch is projected out). A single beam per replan is
-far sparser than lidar's full sweep -- this map only ever "sees" whatever was roughly straight
-ahead at each past replan, not a 360-degree scan -- but accumulates into a genuine 2D map over
-time as the robot moves/turns, which is the one thing step 18's purely-reactive term
-categorically could not do. `--disable-global-planner` reproduces step 17/18's local-only
-behavior exactly, for an intentional before/after comparison.
+Step 19 cast exactly ONE forward beam per replan (the whole frame's far-depth), aimed along
+the robot's current world yaw -- far sparser than lidar's full sweep, and directly confirmed
+(via --verbose traces) to make the computed waypoint oscillate between replans, since one beam
+per 0.25s replan is nowhere near enough evidence for A* to converge on a stable route.
+
+Step 20 is the fix that result pointed at: `--n-beams` (default 7) splits the depth frame into
+that many column-groups spanning the camera's own horizontal FOV (confirmed geometrically,
+same analysis as step 19: fovx == fovy == model.cam_fovy since the render is square, and the
+camera's horizontal look direction is exactly body-frame +x with no lateral mount bias), each
+contributing its own far-depth (per-group clipped column-wise MAXIMUM -- step 18's signal,
+just computed per column-group instead of over the whole frame) and its own angle offset from
+the group's center column. One camera frame now seeds `n_beams` cells into the occupancy grid
+per replan instead of 1 -- still nowhere near lidar's ~180-beam sweep, but a direct, targeted
+fix for the exact sparsity step 19 found, not more planner-side tuning.
+`--disable-global-planner` reproduces step 17/18's local-only behavior exactly, for an
+intentional before/after comparison.
 
 Usage (needs go1_rl_walk/mpc's own venv for mujoco/torch, and slam_sim importable as a
 sibling repo):
@@ -136,6 +142,12 @@ def main():
                               "treated as 'nothing detected' (free space only, no occupied "
                               "cell) rather than a real hit -- avoids flagging a beam that "
                               "just happened to saturate near the clip ceiling.")
+    parser.add_argument("--n-beams", type=int, default=7,
+                         help="step 20: split the depth frame into this many column-groups "
+                              "spanning the camera's horizontal FOV, each seeding its own "
+                              "beam into the occupancy grid per replan (was a single "
+                              "frame-wide beam in step 19) -- the direct fix for step 19's "
+                              "diagnosed waypoint-oscillation-from-sparsity root cause.")
     parser.add_argument("--max-accel", type=float, default=1.5)
     parser.add_argument("--max-yaw-accel", type=float, default=3.0)
     parser.add_argument("--seconds", type=float, default=30.0)
@@ -189,6 +201,22 @@ def main():
 
     cam = OnboardCamera(env.mujoco_go2.model, resolution=pixel_ckpt["resolution"])
 
+    # Step 20: precompute each beam's column-group and world-frame angle offset once --
+    # fixed by the camera's geometry (FOV, resolution), not by anything in a given frame.
+    # fovx == fovy here since the render is square (width == height -> aspect 1 -> mujoco's
+    # fovy-only spec gives an equal horizontal FOV, confirmed directly in step 19). The
+    # camera's own x-axis (xyaxes="0 -1 0 ...") is body -y, and mujoco's image columns
+    # increase along camera +x, so column 0 (image left) is body +y (robot's left, a
+    # POSITIVE world-frame angle offset in the ccw convention OccupancyGrid.update expects)
+    # and the last column (image right) is body -y (a negative offset) -- hence the sign
+    # flip below.
+    depth_cam_id = mj.mj_name2id(env.mujoco_go2.model, mj.mjtObj.mjOBJ_CAMERA, "depth_cam")
+    half_fov_rad = np.radians(float(env.mujoco_go2.model.cam_fovy[depth_cam_id])) / 2.0
+    frame_w = pixel_ckpt["resolution"]
+    beam_col_groups = np.array_split(np.arange(frame_w), args.n_beams)
+    beam_centers = np.array([g.mean() for g in beam_col_groups])
+    beam_angles = (1.0 - 2.0 * beam_centers / (frame_w - 1)) * half_fov_rad
+
     planner = CEMPlanner(
         model, speed_range=(-0.4, 0.8), lateral_range=(-0.3, 0.3), yaw_rate_range=(-1.0, 1.0),
         horizon_steps=args.horizon_steps, macro_dt=10 / 200.0,
@@ -213,7 +241,7 @@ def main():
     reached, fell = False, False
     t_reached = None
     last_waypoints = None
-    n_beams = 0
+    n_replans_mapped = 0
 
     def _add_marker(scene, pos_xy, rgba, size=0.15):
         if scene.ngeom >= scene.maxgeom:
@@ -263,11 +291,13 @@ def main():
             nav_goal = tuple(goal)
             last_waypoints = None
             if not args.disable_global_planner:
-                far_depth = float(min(depth_frame.max(), args.depth_clip))
-                hit = far_depth < (args.depth_clip - args.far_depth_hit_margin)
-                grid.update((x, y, yaw), ranges=np.array([far_depth]),
-                            hit=np.array([hit]), angles=np.array([0.0]))
-                n_beams += 1
+                col_max = depth_frame.max(axis=0)  # per-column far-depth, shape (frame_w,)
+                beam_ranges = np.minimum(
+                    np.array([col_max[g].max() for g in beam_col_groups]), args.depth_clip)
+                beam_hits = beam_ranges < (args.depth_clip - args.far_depth_hit_margin)
+                grid.update((x, y, yaw), ranges=beam_ranges,
+                            hit=beam_hits, angles=beam_angles)
+                n_replans_mapped += 1
                 waypoints = plan_path(grid, (x, y), tuple(goal),
                                        robot_radius=args.robot_radius,
                                        occ_threshold=args.occ_threshold)
@@ -340,7 +370,8 @@ def main():
         save_gif(map_frames, args.record_map, fps=6.0)
         print(f"Saved {len(map_frames)} frames to {args.record_map}")
     if not args.disable_global_planner:
-        print(f"Camera-derived map: {n_beams} single-beam updates over the episode.")
+        print(f"Camera-derived map: {n_replans_mapped} replans x {args.n_beams} beams each "
+              f"({n_replans_mapped * args.n_beams} total beam updates over the episode).")
 
 
 if __name__ == "__main__":

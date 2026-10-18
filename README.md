@@ -123,7 +123,12 @@ an existing one.
     improve the measured outcome -- a single coarse forward beam per replan makes the map too
     sparse/noisy for A* to converge on one stable route (the chosen waypoint was observed
     oscillating between routing north and south across consecutive replans), unlike lidar's
-    full sweep per scan; see below).
+    full sweep per scan + step 20 tried the direct fix (7 beams spread across the camera's
+    ~45deg FOV instead of 1), confirmed it measurably stabilizes the map (long stable stretches
+    replace near-every-replan flip-flopping) but STILL doesn't fix the outcome -- all seeds
+    still fall or time out, at comparable final distances to step 19, with the camera reactive
+    term often not even engaging on the run that fails -- map sparsity was A real contributor,
+    not THE whole story; see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1421,6 +1426,53 @@ per-replan reading -- e.g. several beams spread across the camera's own ~45deg h
 further planner-side tuning (waypoint smoothing/hysteresis was considered but would only mask
 an underlying map that's genuinely too sparse to trust, not fix it).
 
+### Step 20: denser per-replan sensing -- the diagnosed fix, applied, still not enough
+
+The direct fix step 19 pointed at: `navigate_wam_pixel.py` gained `--n-beams` (default 7), which
+splits the depth frame into that many column-groups spanning the camera's own horizontal FOV
+(confirmed `fovx == fovy == model.cam_fovy` since the render is square) instead of one
+frame-wide aggregate beam. Each group contributes its own far-depth (step 18's signal, now
+computed per column-group) and its own angle offset from that group's center column, all fed
+into the SAME `OccupancyGrid.update()` in one call -- `wam/global_planner.py`'s A* is still
+completely unmodified. A quick `--record-map` smoke test confirmed the geometry is right before
+running anything further: the accumulated free-space region visibly fans out from the robot in
+a wedge matching the camera's FOV, not a single line, and `plan_path` still returns sensible
+waypoints.
+
+This genuinely helps the thing it targeted: re-examining a `--verbose` trace (seed 2) shows long
+stable stretches where the waypoint holds roughly steady or drifts smoothly for 10+ consecutive
+replans, including stretches where the map opens up a clear line of sight straight to the goal
+(`nav_goal` reverting to the raw goal, no waypoint needed) -- a different character than step
+19's near-every-replan flip-flopping. There's still at least one abrupt reversal per episode
+(one real trace jumped from `(1.05, 4.65)` -- routing north around the island -- to
+`(2.95, 1.65)` -- routing south -- in one replan), so oscillation isn't eliminated, but it's
+far less constant.
+
+But the measured outcome is still unchanged. 5-seed test, full config (A* + reactive camera
+cost, same seeds/checkpoints as step 19 for a direct comparison): 7.87, 7.19, 6.51, 7.89, 7.73 --
+all still fell or timed out (mean final distance ~7.4m, statistically indistinguishable from
+step 19's 7.51/7.44/7.41/7.57/6.51). A*-only (`--disable-pixel-cost`): 7.87, 7.19, 6.51 -- also
+unchanged in outcome, though notably closer on average than step 19's A*-only run (8.24/7.48/
+7.67) without ever actually reaching the goal. Seeds 0 and 2 landed on the EXACT same final
+distance with the reactive term on or off, confirming (as in step 18/19) that the camera's
+reactive term frequently never engages at all once A* is driving -- re-checking that seed 2's
+trace, `pixel_cost` stays at 0.00 for the entire episode, and the fall happens while the robot is
+skirting tight along the island's southern edge under a sharp commanded turn, chasing an
+A*-planned waypoint, not reacting to a last-second camera reading.
+
+**Honest conclusion**: denser sensing was the right next experiment to run -- it directly,
+measurably fixed the specific mechanism step 19 diagnosed (map sparsity causing waypoint
+oscillation) without touching the planner -- but map stability turns out to be necessary, not
+sufficient. The remaining failures now look more like close-quarters maneuvering/control
+accuracy near the island's corners (tight turns chasing a legitimate waypoint) than a mapping or
+planning defect. Fixing that is a different kind of problem (trajectory tracking/control
+authority near obstacles, or the planner's own safety margins around A* waypoints) than
+anything this pixel-rendering mini-plan's camera-perception chain can address by itself. Given
+steps 17-20 have now tried and fixed/ruled out seeding, cost-head target, corner-biased data,
+global planning, and sensing density in turn, with the headline navigation outcome essentially
+flat across all of them, this is a reasonable natural stopping point for the mini-plan unless a
+specific further hypothesis is worth testing.
+
 ## Repository layout
 
 ```
@@ -1479,7 +1531,8 @@ wam/
 ├── navigate_wam_pixel.py                                            # Stage 12 step 17: camera-only CEM navigation (no lidar/occupancy map)
 │                                                                       # (step 18: + torch.manual_seed fix, --pixel-horizon-steps
 │                                                                       #  properly threaded, verbose pixel_cost diagnostic;
-│                                                                       #  step 19: + camera-derived occupancy map, A*, --record-map)
+│                                                                       #  step 19: + camera-derived occupancy map, A*, --record-map;
+│                                                                       #  step 20: + --n-beams, multi-beam per-replan sensing)
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth

@@ -132,6 +132,8 @@ an existing one.
     target, corner-biased data, global planning, and sensing density in turn, without ever
     moving the headline navigation outcome, a reasonable stopping point absent a genuinely new
     hypothesis; see below).
+13. **Replace ground-truth pose with a real, noisy/drifting SLAM belief pose** -- DONE (a
+    clean, decisive positive result -- see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1512,6 +1514,61 @@ Best checkpoints if this track is ever revisited: `pixel_world_model_wall_explor
 (dynamics, step 16) + `pixel_cost_head_explore_far.pt` (cost head, step 18, far-depth target),
 with `navigate_wam_pixel.py --n-beams 7` (step 20, the default) for the occupancy map.
 
+### Stage 13: replace ground-truth pose with a real, noisy/drifting SLAM belief pose
+
+Every stage since Stage 3 has deliberately used `MPCResidualEnv`'s own ground-truth pose to
+build the occupancy map and feed the planner -- documented at the time as an explicit scope
+cut ("localization-under-drift is a separate, already-solved problem over in slam_sim's own
+Stage 4/6"). This closes that gap: `navigate_wam_obstacles.py` gains `--noisy-localization`,
+porting slam_sim's own Stage 4 predict/correct/update SLAM loop onto the real Go2 for the
+first time (slam_sim's own version only ever ran against its simplified, massless toy
+diff-drive robot).
+
+**Mechanism, reusing as much of slam_sim's own already-tuned code as possible rather than
+re-deriving it**: every physics tick, the robot's OWN executed body-frame velocity
+(`obs`'s v_body/w_body -- what a real onboard velocity estimate would read, not a command
+setpoint) is corrupted with the exact Thrun/Burgard/Fox odometry noise model
+`slam.robot.DiffDriveRobot` already uses by default (`sigma_v_frac=0.02`,
+`sigma_omega_frac=0.02`, `sigma_omega_from_v=0.01`) -- extended with the identical v-noise
+formula for LATERAL velocity too, since Go2 can strafe and a pure diff-drive robot can't, so
+`DiffDriveRobot` never needed that term. This noisy reading is integrated into both an
+uncorrected `odom_pose` (kept only as a "what if nothing corrected this" baseline) and a
+`belief_pose` prediction. Every lidar scan (still cast from the robot's TRUE physical
+location -- that's where the sensor actually is), `slam.scan_match.icp_2d` (completely
+unmodified) aligns the scan against `grid.occupied_points()` to correct the belief prediction.
+`belief_pose` -- never true pose -- is what builds the occupancy grid, what the CEM planner
+is told as its own current pose, and what A* is told as its start point; true pose is kept
+ONLY for scoring (goal-reached distance, final `final_dist`) and as the lidar's physical
+sensing origin, the same true/belief separation slam_sim's own docs insist on ("never fed to
+any mapping/localization algorithm, which would be cheating").
+
+**Multi-seed result, `eval_localization.py`, the SAME 4 start/goal pairs and 3-seed protocol
+`eval_obstacles.py` already established**: 12/12 reached the goal with ground-truth pose
+(the known-good baseline) and **12/12 ALSO reached the goal with noisy localization enabled
+-- zero falls, zero timeouts, either way**, at essentially identical times per pair (within
+0.1-1.8s of the ground-truth baseline, ordinary seed-to-seed variance, not a slowdown). ICP
+converged on 96-100% of scans in every single trial. Belief drift stayed small and
+consistently bounded across all 12 noisy trials (0.031-0.045m, largely independent of episode
+length), while the UNCORRECTED raw-odometry drift it's being compared against grew larger and
+far more variable (0.011-0.290m) -- direct, quantitative confirmation that the ICP correction
+step is doing real work, not just along for the ride.
+
+**Honest conclusion**: this is a clean, decisive positive result, a different character from
+most of this project's recent history (Stage 11's inconclusive closure, Stage 12's
+closed-loop navigation never closing the gap) -- the realistic localization uncertainty this
+stage introduces gets fully absorbed by the SAME SLAM correction loop slam_sim already proved
+out on its own toy robot, with no measurable cost to navigation performance on this task.
+`media/navigate_wam_localization_robot.gif` and `media/navigate_wam_localization_map.gif`
+(the latter showing the true/odometry/belief trails diverging and the belief trail tracking
+back close to true) capture one of the larger-drift runs (detour B, seed 101: odometry alone
+drifted 0.219-0.290m, belief stayed within 0.036-0.037m). Worth noting as a scope boundary,
+not a weakness found: this island world's walls are seen from many angles over a long
+episode, giving ICP plenty to match against -- a sparser or more aliased environment (long
+featureless corridors, repetitive geometry) is a harder SLAM problem in general and wasn't
+specifically stress-tested here; `n_icp_converged`/`n_icp_attempts` (printed by `--verbose`
+and the final summary line) is the diagnostic to watch if this is ever tried somewhere
+sparser.
+
 ## Repository layout
 
 ```
@@ -1545,6 +1602,9 @@ wam/
 ├── navigate_wam_chunked.py      # Stage 6: same, via the chunked model + planner
 ├── eval_navigate.py              # Stage 2/6: multi-seed comparison (wam/wam-chunked/mpc laws)
 ├── navigate_wam_obstacles.py       # Stage 3/3b/5: obstacle-aware planning in slam_sim's island world
+│                                     # (Stage 13: + --noisy-localization, a ported slam_sim Stage 4
+│                                     #  predict/correct/update SLAM loop -- belief_pose replaces
+│                                     #  ground truth for the grid/planner/A*)
 ├── eval_obstacles.py                 # Stage 3b: multi-seed A*-enabled vs. disabled comparison
 ├── eval_terrain.py                     # Stage 4: multi-seed flat-vs-terrain model comparison
 ├── eval_obstacles_terrain.py             # Stage 5: multi-seed obstacles+terrain comparison
@@ -1572,6 +1632,7 @@ wam/
 │                                                                       #  properly threaded, verbose pixel_cost diagnostic;
 │                                                                       #  step 19: + camera-derived occupancy map, A*, --record-map;
 │                                                                       #  step 20: + --n-beams, multi-beam per-replan sensing)
+├── eval_localization.py                                             # Stage 13: multi-seed ground-truth vs. noisy-localization comparison
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth
@@ -1651,6 +1712,8 @@ wam/
 ├── media/pixel_world_model_wall_explore_corners_depth_rollout.png                                              # Stage 12 step 18's rollout grid (corner-biased)
 ├── media/navigate_wam_pixel_step20_robot.gif                                                                     # Stage 12 step 20's camera-only + A* + multi-beam navigation demo
 ├── media/navigate_wam_pixel_step20_map.gif                                                                         # Stage 12 step 20's camera-derived occupancy map + A* path, same run
+├── media/navigate_wam_localization_robot.gif                                                                         # Stage 13's noisy-localization navigation demo (detour B, seed 101)
+├── media/navigate_wam_localization_map.gif                                                                             # Stage 13's true/odometry/belief trails, same run
 ├── requirements.txt
 └── README.md
 ```

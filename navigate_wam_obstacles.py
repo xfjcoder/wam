@@ -13,14 +13,27 @@ over time. This script adds the planning side: feeding `grid.occupied_points()` 
 `CEMPlanner.plan()`'s `obstacle_points` argument every replan, and (new) running
 `wam/global_planner.py`'s A* over that same grid to pick WHICH goal to hand the CEM.
 
-Deliberately uses the REAL ground-truth pose (from MPCResidualEnv's own info) to build the
-occupancy map, not slam_sim's ICP-corrected belief pose -- localization-under-drift is a
-separate, already-solved problem over in slam_sim's own Stage 4/6; this stage's new ground
-is PLANNING around what's been sensed, not re-demonstrating localization. One consequence
-worth knowing: the map only contains what lidar has actually scanned so far, so the planner
-can only avoid obstacles it has already sensed -- an obstacle just beyond lidar range or
-behind the robot is invisible to it until a scan covers that direction, same limitation any
-real lidar-mapping-then-planning stack has.
+By default still uses the REAL ground-truth pose (from MPCResidualEnv's own info) to build
+the occupancy map -- the original scope here was PLANNING around what's been sensed, not
+localization, so this deliberately deferred to slam_sim's own already-solved Stage 4/6
+localization work rather than re-demonstrating it.
+
+Stage 13 closes that gap: `--noisy-localization` replaces ground truth with a `belief_pose`
+maintained the SAME way slam_sim's Stage 4 does for its own toy diff-drive robot, now wired
+onto the real MuJoCo Go2 -- odometry noise injected into the robot's OWN executed body-frame
+velocity (`obs`'s v_body/w_body, not a command setpoint) via the exact Thrun/Burgard/Fox
+noise model `slam.robot.DiffDriveRobot` already uses (reused verbatim, not re-tuned, extended
+with the SAME v-noise formula for lateral velocity too -- Go2 can strafe, unlike a pure
+diff-drive robot), corrected every lidar scan by `slam.scan_match.icp_2d` against the map
+built so far (also reused completely unmodified). `belief_pose` -- not true pose -- is what
+feeds the occupancy grid, the CEM planner's current-state pose, and A*'s start point; true
+pose is kept ONLY for scoring (goal-reached distance, final_dist) and as the lidar's own
+physical sensing origin -- the same true/belief separation slam_sim's own docs insist on
+("never fed to any mapping/localization algorithm, which would be cheating"). One consequence
+worth knowing (independent of localization): the map only contains what lidar has actually
+scanned so far, so the planner can only avoid obstacles it has already sensed -- an obstacle
+just beyond lidar range or behind the robot is invisible to it until a scan covers that
+direction, same limitation any real lidar-mapping-then-planning stack has.
 
 The default world is slam_sim's own `World.loop_corridor()`: a 12x8m rectangle with a 4x4m
 island in the middle, open on all sides -- a straight line from one corner to the opposite
@@ -59,6 +72,7 @@ from demo_stage6_go2_world import build_env_xml              # noqa: E402
 from slam.world import World                                 # noqa: E402
 from slam.occupancy_grid import OccupancyGrid                 # noqa: E402
 from slam.mj_lidar import mj_lidar_scan                        # noqa: E402
+from slam.scan_match import icp_2d, scan_to_local_points         # noqa: E402
 from slam.viz import render_frame, save_gif                     # noqa: E402
 
 from wam.model import WorldModel                            # noqa: E402
@@ -99,6 +113,29 @@ def main():
     parser.add_argument("--lidar-beams", type=int, default=180)
     parser.add_argument("--lidar-every", type=int, default=10, help="control ticks between lidar scans")
     parser.add_argument("--occ-threshold", type=float, default=0.7)
+    parser.add_argument("--noisy-localization", action="store_true",
+                         help="Stage 13: replace ground-truth pose with a belief pose "
+                              "maintained via noisy odometry + ICP scan-matching against the "
+                              "map built so far (slam_sim's own Stage 4 approach, ported onto "
+                              "the real Go2) -- the occupancy grid, CEM planner, and A* all "
+                              "see ONLY this belief pose; true pose is kept solely for scoring "
+                              "(goal-reached distance, final_dist) and as the lidar's physical "
+                              "sensing origin. Default off reproduces this script's exact "
+                              "original ground-truth-pose behavior.")
+    parser.add_argument("--odom-noise-v-frac", type=float, default=0.02,
+                         help="odometry noise model (Thrun/Burgard/Fox, same as "
+                              "slam.robot.DiffDriveRobot's default): linear-velocity noise "
+                              "std scales with |v| by this fraction (applied to both forward "
+                              "and lateral body velocity).")
+    parser.add_argument("--odom-noise-omega-frac", type=float, default=0.02,
+                         help="angular-velocity noise std scales with |yaw_rate| by this "
+                              "fraction.")
+    parser.add_argument("--odom-noise-cross", type=float, default=0.01,
+                         help="angular-velocity noise ALSO scales with |v| by this fraction "
+                              "(straight-line driving still accumulates heading drift, "
+                              "matching real wheel/leg-odometry behavior).")
+    parser.add_argument("--icp-max-correspondence-dist", type=float, default=0.5)
+    parser.add_argument("--icp-min-correspondences", type=int, default=20)
     parser.add_argument("--terrain-amplitude-max", type=float, default=0.0,
                          help="Stage 4/5: (0, max) m peak-to-peak random bumps added to the "
                               "island world's ground, resampled at env reset -- 0.0 (default) "
@@ -169,6 +206,18 @@ def main():
     reached, fell = False, False
     t_reached = None
 
+    # Stage 13: belief_pose is what the planner/map actually see when --noisy-localization is
+    # on; odom_pose is the UNCORRECTED noisy trail, kept only to show ICP's correction is
+    # doing something (same 3-pose convention slam_sim's own demo_stage4_slam.py uses). Both
+    # start at the true start pose -- "known start pose" is the standard SLAM assumption, not
+    # a shortcut (a robot deployed at a known charging-dock/start marker knows its own pose
+    # exactly at t=0; drift only accumulates from there).
+    loc_rng = np.random.default_rng(args.seed)
+    belief_x, belief_y, belief_yaw = args.start_x, args.start_y, 0.0
+    odom_x, odom_y, odom_yaw = args.start_x, args.start_y, 0.0
+    belief_trail, odom_trail = [], []
+    n_icp_attempts, n_icp_converged = 0, 0
+
     def _add_marker(scene, pos_xy, rgba, size=0.15):
         if scene.ngeom >= scene.maxgeom:
             return
@@ -210,24 +259,33 @@ def main():
             obstacle_pts = (None if args.disable_obstacle_cost
                              else grid.occupied_points(threshold=args.occ_threshold))
 
+            # Stage 13: the planner/A* get whatever pose the robot itself BELIEVES it's at --
+            # true (x, y, yaw) only when localization is ground-truth (the original behavior).
+            plan_pose = ((belief_x, belief_y, belief_yaw) if args.noisy_localization
+                         else (x, y, yaw))
+
             nav_goal = tuple(goal)
             last_waypoints = None
             if not args.disable_obstacle_cost and not args.disable_global_planner:
-                waypoints = plan_path(grid, (x, y), tuple(goal),
+                waypoints = plan_path(grid, plan_pose[:2], tuple(goal),
                                        robot_radius=args.robot_radius,
                                        occ_threshold=args.occ_threshold)
                 if waypoints:
                     nav_goal = waypoints[0]
                     last_waypoints = waypoints
 
-            result = planner.plan(state, (x, y, yaw), nav_goal, warm_start=target_action,
+            result = planner.plan(state, plan_pose, nav_goal, warm_start=target_action,
                                    obstacle_points=obstacle_pts)
             target_action = result.action.numpy()
             if args.verbose:
                 n_obs = 0 if obstacle_pts is None else len(obstacle_pts)
                 n_wp = 0 if last_waypoints is None else len(last_waypoints)
+                loc_note = ""
+                if args.noisy_localization:
+                    drift = float(np.hypot(belief_x - x, belief_y - y))
+                    loc_note = f" belief=({belief_x:+.2f},{belief_y:+.2f}) drift={drift:.2f}"
                 print(f"  t={step/200.0:5.1f}s pos=({x:+.2f},{y:+.2f}) yaw={yaw:+.2f} "
-                      f"dist={dist:.2f} nav_goal=({nav_goal[0]:+.2f},{nav_goal[1]:+.2f}) "
+                      f"dist={dist:.2f}{loc_note} nav_goal=({nav_goal[0]:+.2f},{nav_goal[1]:+.2f}) "
                       f"n_waypoints={n_wp} action={target_action} n_obs={n_obs} "
                       f"cost={result.cost:.2f}")
 
@@ -242,9 +300,50 @@ def main():
         true_trail.append([x, y])
 
         if step % args.lidar_every == 0:
+            # Sensor is physically mounted on the real robot -- always cast from TRUE pose,
+            # localization uncertainty or not (this is ground truth about where the lidar
+            # actually is, not a belief the algorithm gets to use for anything else).
             ranges, hit, angles = mj_lidar_scan(
                 env.mujoco_go2.model, env.mujoco_go2.data, (x, y), yaw, n_beams=args.lidar_beams)
-            grid.update((x, y, yaw), ranges, hit, angles)
+
+            if args.noisy_localization:
+                dt_loc = args.lidar_every / 200.0
+                v_fwd, v_lat, yaw_rate = float(obs[0]), float(obs[1]), float(obs[5])
+                # Thrun/Burgard/Fox odometry noise model, identical to
+                # slam.robot.DiffDriveRobot's default (0.02, 0.02, 0.01) -- extended with the
+                # SAME v-noise formula for lateral velocity (Go2 can strafe; a pure
+                # diff-drive robot can't, so DiffDriveRobot never needed this term).
+                v_fwd_n = v_fwd + loc_rng.normal(0.0, args.odom_noise_v_frac * abs(v_fwd) + 1e-4)
+                v_lat_n = v_lat + loc_rng.normal(0.0, args.odom_noise_v_frac * abs(v_lat) + 1e-4)
+                yaw_rate_n = yaw_rate + loc_rng.normal(
+                    0.0, args.odom_noise_omega_frac * abs(yaw_rate)
+                    + args.odom_noise_cross * (abs(v_fwd) + abs(v_lat)) + 1e-4)
+
+                def _integrate(px, py, pyaw):
+                    c, s = np.cos(pyaw), np.sin(pyaw)
+                    px_next = px + (v_fwd_n * c - v_lat_n * s) * dt_loc
+                    py_next = py + (v_fwd_n * s + v_lat_n * c) * dt_loc
+                    pyaw_next = (pyaw + yaw_rate_n * dt_loc + np.pi) % (2 * np.pi) - np.pi
+                    return px_next, py_next, pyaw_next
+
+                odom_x, odom_y, odom_yaw = _integrate(odom_x, odom_y, odom_yaw)
+                pred_x, pred_y, pred_yaw = _integrate(belief_x, belief_y, belief_yaw)
+
+                local_pts = scan_to_local_points(ranges, hit, angles)
+                map_pts = grid.occupied_points(threshold=args.occ_threshold)
+                corrected, converged, _ = icp_2d(
+                    local_pts, map_pts, (pred_x, pred_y, pred_yaw),
+                    max_correspondence_dist=args.icp_max_correspondence_dist,
+                    min_correspondences=args.icp_min_correspondences)
+                belief_x, belief_y, belief_yaw = (
+                    corrected if converged else (pred_x, pred_y, pred_yaw))
+                n_icp_attempts += 1
+                n_icp_converged += int(converged)
+                belief_trail.append([belief_x, belief_y])
+                odom_trail.append([odom_x, odom_y])
+
+            map_pose = (belief_x, belief_y, belief_yaw) if args.noisy_localization else (x, y, yaw)
+            grid.update(map_pose, ranges, hit, angles)
             n_lidar_scans += 1
             if args.record_map and n_lidar_scans % args.map_render_every == 0:
                 path_points = (np.array(last_waypoints) if last_waypoints is not None
@@ -252,6 +351,10 @@ def main():
                 map_frames.append(render_frame(
                     world, (x, y, yaw), occupancy_grid=grid, scan_points=path_points,
                     true_trail=np.array(true_trail) if len(true_trail) > 1 else None,
+                    belief_trail=(np.array(belief_trail) if args.noisy_localization
+                                  and len(belief_trail) > 1 else None),
+                    odom_trail=(np.array(odom_trail) if args.noisy_localization
+                                and len(odom_trail) > 1 else None),
                     status_text=f"goal ({goal[0]:.1f},{goal[1]:.1f})"))
 
         if args.record_robot and step % 16 == 0:
@@ -278,6 +381,14 @@ def main():
     else:
         print(f"Did NOT reach the goal within {args.seconds:.0f}s "
               f"(final distance {final_dist:.2f} m).")
+
+    if args.noisy_localization:
+        belief_drift = float(np.hypot(belief_x - x, belief_y - y))
+        odom_drift = float(np.hypot(odom_x - x, odom_y - y))
+        pct = 100.0 * n_icp_converged / n_icp_attempts if n_icp_attempts else 0.0
+        print(f"Final localization drift: belief (ICP-corrected) = {belief_drift:.3f}m, "
+              f"raw odometry = {odom_drift:.3f}m. ICP converged on {n_icp_converged}/"
+              f"{n_icp_attempts} scans ({pct:.0f}%).")
 
     if robot_renderer is not None:
         robot_renderer.close()

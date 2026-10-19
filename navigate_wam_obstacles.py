@@ -176,7 +176,24 @@ def main():
                               "by how far n_valid is above that floor, ramping to full trust "
                               "this many correspondences above it -- e.g. 50 means a 70-point "
                               "match (20+50) is fully trusted, a 20-point match is not trusted "
-                              "at all (falls back to the odometry prediction).")
+                              "at all (falls back to the odometry prediction). Multi-seed "
+                              "verification on the sparse blind-crossing case this targets came "
+                              "back genuinely mixed, not a win -- see --icp-reject-below-"
+                              "correspondences for the hard-cutoff alternative tried next.")
+    parser.add_argument("--icp-reject-below-correspondences", type=int, default=0,
+                         help="Hard-cutoff alternative to --icp-confidence-margin's scaling "
+                              "ramp, tried after that ramp's own multi-seed test came back a "
+                              "wash on the sparse blind-crossing case (scaling DOWN a "
+                              "correction built from only a handful of points still applies "
+                              "that much noise -- it moves which seeds get unlucky, it doesn't "
+                              "fix the underlying variance). 0 (default) disables it. When set, "
+                              "any scan whose ICP correspondence count (n_valid) falls below "
+                              "this absolute count is treated as NOT converged, taking the "
+                              "exact same odometry-only fallback path an unconverged scan "
+                              "already does, instead of applying any correction at all -- "
+                              "scaled or not. Independent of --icp-degeneracy-filter and "
+                              "--icp-confidence-margin; can be combined with either or used "
+                              "alone.")
     parser.add_argument("--terrain-amplitude-max", type=float, default=0.0,
                          help="Stage 4/5: (0, max) m peak-to-peak random bumps added to the "
                               "island world's ground, resampled at env reset -- 0.0 (default) "
@@ -400,6 +417,16 @@ def main():
                     local_pts, map_pts, (pred_x, pred_y, pred_yaw),
                     max_correspondence_dist=args.icp_max_correspondence_dist,
                     min_correspondences=args.icp_min_correspondences)
+
+                if (converged and args.icp_reject_below_correspondences > 0
+                        and n_valid_icp < args.icp_reject_below_correspondences):
+                    # The hard-cutoff half of the confidence idea --icp-confidence-margin tried
+                    # to handle with a scaling ramp instead -- a correspondence set this small
+                    # isn't "slightly less trustworthy", it's barely informative at all, and
+                    # even a down-weighted correction built from it is closer to injecting noise
+                    # than correcting drift (confirmed: the margin's own multi-seed test on this
+                    # exact case came back a wash, not a win). Reject it outright.
+                    converged = False
 
                 if converged and args.icp_degeneracy_filter:
                     # icp_2d's own residual/convergence check has no way to tell "confidently

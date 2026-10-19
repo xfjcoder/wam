@@ -141,8 +141,12 @@ an existing one.
     just caution; `--icp-degeneracy-filter` then fixed the aliasing half of it cleanly (every
     corridor trial improved, including turning one outright fall into a clean reach) while a
     count-based `--icp-confidence-margin` built for the remaining sparse/low-correspondence-
-    count half came back genuinely mixed once measured cleanly -- see below. Also: found and
-    fixed a reused CEM-sampling seeding bug, the same class step 18 fixed in
+    count half came back genuinely mixed once measured cleanly; a hard-cutoff alternative,
+    `--icp-reject-below-correspondences`, then gave a narrower but real win -- a steadier,
+    lower-variance belief drift than the scaling margin, though it doesn't fix the sparse
+    world's N-S case, which fails under ground truth too (a task-difficulty ceiling, not a
+    localization one) -- see below. Also: found and fixed a reused CEM-sampling seeding bug,
+    the same class step 18 fixed in
     `navigate_wam_pixel.py`, that had silently affected every multi-seed eval run through this
     script since Stage 3b).
 
@@ -1755,6 +1759,44 @@ scalar but a different fallback entirely for that regime -- e.g. holding the pri
 (trusting odometry alone, no ICP correction at all) once `n_valid` drops below some hard floor,
 rather than trying to tune how much of a statistically-unreliable correction to trust.
 
+### Stage 13 addendum, one more try: `--icp-reject-below-correspondences`, a hard cutoff instead of a scaling ramp
+
+The fallback idea flagged just above IS built: `--icp-reject-below-correspondences N` treats
+any scan whose ICP correspondence count (`n_valid`) falls below `N` as NOT converged -- the
+exact same odometry-only fallback path an unconverged scan already takes -- instead of applying
+any correction, scaled or not. Independent of `--icp-degeneracy-filter` and
+`--icp-confidence-margin`; combinable with either or used alone. Reasoning: a correspondence set
+this small isn't "slightly less trustworthy" (the margin's assumption), it's barely informative
+at all, and down-weighting it still injects that much noise -- confirmed by the margin's own
+wash result above. Tested at `N=40` (double `--icp-min-correspondences`'s default floor of 20,
+the same order of magnitude the margin's own effective range used, not exhaustively tuned)
+against the same default-world/corridor/sparse comparisons:
+
+- **Default world and corridor**: both a confirmed no-op, byte-identical to `--icp-degeneracy-
+  filter` alone in every trial (`n_valid` never drops anywhere near 40 on either world) --
+  exactly as expected, same as the margin's own no-op result there.
+- **Sparse, E-W crossing**: ties the filter-alone reach count (2/3, though a different seed
+  succeeds -- seed 102 now reaches instead of seed 100) and clearly beats the margin's 1/3.
+  More telling than the raw count: belief drift on every trial that still half-functions stays
+  low and tight (0.098-0.379m) vs. the margin's own wider, worse spread on this same crossing
+  (0.086-0.594m, two of three above 0.3m).
+- **Sparse, N-S crossing**: still fails 3/3 under every condition tested, including ground
+  truth -- confirming again this is a task-difficulty ceiling, not something any localization
+  fix removes. But belief drift here is the tightest and most consistent of any condition
+  measured in this whole addendum: 0.040m, 0.062m, 0.061m, vs. the filter-alone's
+  0.056-0.746m and the margin's scattered 0.020-0.594m. No single bad correction blows up the
+  estimate the way it can under either of the other two approaches.
+
+**Honest conclusion**: a genuine, if narrow, improvement -- not a fix for the sparse-world task
+outcome (N-S still fails every time regardless, a difficulty problem no localization change
+touches) but a more RELIABLE localization signal than either alternative: no worse than the
+degeneracy filter alone on success count, clearly steadier (lower worst-case drift, less
+seed-to-seed variance) than the scaling-ramp margin in both sparse pairs tested. Supports the
+reasoning that refusing an unreliable correction outright beats partially trusting it. Default
+stays `0` (off), same convention as every flag in this project; worth preferring over
+`--icp-confidence-margin` if this regime is ever revisited in earnest, though neither is a
+complete answer to the underlying "ICP has nothing to work with for 10+ meters" problem.
+
 ## Repository layout
 
 ```
@@ -1795,7 +1837,9 @@ wam/
 │                                     #  + --icp-degeneracy-filter, the confirmed fix for the
 │                                     #  corridor-aliasing failure mode those worlds exposed;
 │                                     #  + --icp-confidence-margin, a count-based check that
-│                                     #  came back genuinely mixed, not a proven fix; also:
+│                                     #  came back genuinely mixed, not a proven fix;
+│                                     #  + --icp-reject-below-correspondences, a hard-cutoff
+│                                     #  alternative that gave a narrower but real win; also:
 │                                     #  fixed a reused CEM-sampling seeding bug, same class as
 │                                     #  step 18's fix in navigate_wam_pixel.py)
 ├── eval_obstacles.py                 # Stage 3b: multi-seed A*-enabled vs. disabled comparison

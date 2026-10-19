@@ -30,7 +30,7 @@ PAIRS = [
 
 
 def run_one(start_x, start_y, goal_x, goal_y, seed, seconds, noisy_localization,
-            degeneracy_filter=False, confidence_margin=0.0):
+            degeneracy_filter=False, confidence_margin=0.0, reject_below=0):
     cmd = ["/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3",
            str(Path(__file__).resolve().parent / "navigate_wam_obstacles.py"),
            "--start-x", str(start_x), "--start-y", str(start_y),
@@ -42,6 +42,8 @@ def run_one(start_x, start_y, goal_x, goal_y, seed, seconds, noisy_localization,
         cmd.append("--icp-degeneracy-filter")
     if confidence_margin > 0:
         cmd += ["--icp-confidence-margin", str(confidence_margin)]
+    if reject_below > 0:
+        cmd += ["--icp-reject-below-correspondences", str(reject_below)]
     out = subprocess.run(cmd, capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent))
     text = out.stdout + out.stderr
 
@@ -77,17 +79,26 @@ def main():
                           "value -- to confirm the count-based confidence check ALSO doesn't "
                           "regress the default world (n_valid there is ~170-180, far above "
                           "any realistic margin, so this should be a true no-op).")
+    ap.add_argument("--with-reject-below", type=int, default=0,
+                     help="add a condition -- noisy localization WITH --icp-degeneracy-filter "
+                          "AND --icp-reject-below-correspondences set to this value -- to "
+                          "confirm the hard-cutoff alternative ALSO doesn't regress the "
+                          "default world (n_valid there is ~137-372, far above any realistic "
+                          "cutoff, so this should be a true no-op).")
     args = ap.parse_args()
 
-    conditions = [(False, False, 0.0, "GROUND-TRUTH POSE (original)"),
-                  (True, False, 0.0, "NOISY LOCALIZATION (Stage 13 belief pose)")]
+    conditions = [(False, False, 0.0, 0, "GROUND-TRUTH POSE (original)"),
+                  (True, False, 0.0, 0, "NOISY LOCALIZATION (Stage 13 belief pose)")]
     if args.with_degeneracy_filter:
-        conditions.append((True, True, 0.0, "NOISY LOCALIZATION + --icp-degeneracy-filter"))
+        conditions.append((True, True, 0.0, 0, "NOISY LOCALIZATION + --icp-degeneracy-filter"))
     if args.with_confidence_margin > 0:
-        conditions.append((True, True, args.with_confidence_margin,
+        conditions.append((True, True, args.with_confidence_margin, 0,
                             f"NOISY LOCALIZATION + filter + confidence-margin={args.with_confidence_margin:.0f}"))
+    if args.with_reject_below > 0:
+        conditions.append((True, True, 0.0, args.with_reject_below,
+                            f"NOISY LOCALIZATION + filter + reject-below={args.with_reject_below}"))
 
-    for noisy_localization, degeneracy_filter, confidence_margin, label in conditions:
+    for noisy_localization, degeneracy_filter, confidence_margin, reject_below, label in conditions:
         print(f"=== {label} ===")
         for name, sx, sy, gx, gy in PAIRS:
             results = []
@@ -95,7 +106,7 @@ def main():
                 seed = args.base_seed + i
                 status, t, final_dist, drift = run_one(
                     sx, sy, gx, gy, seed, args.seconds, noisy_localization, degeneracy_filter,
-                    confidence_margin)
+                    confidence_margin, reject_below)
                 results.append((seed, status, t, final_dist, drift))
             summary = ", ".join(
                 f"seed={s}:{st}" + (f"@{t:.1f}s" if t is not None else f"(d={d:.2f}m)")

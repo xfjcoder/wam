@@ -158,6 +158,17 @@ an existing one.
     track's failure isn't corner-specific after all -- it mostly fails even the straight
     "no obstacle" pair under PERFECT pose, extending Stage 12's own closure finding past the
     scope it was originally measured in; see below).
+15. **Different dynamics: SLAM localization on uneven terrain** -- DONE (a genuinely positive
+    result, the first new-environment test after moving past the flat-ground island world:
+    Stage 4/5's terrain genuinely inflates raw odometry drift versus flat ground (up to 0.9m in
+    one trial, vs. flat ground's typical <0.3m) -- consistent with terrain-induced body
+    pitch/roll perturbing the executed body-frame velocity the odometry integrates -- but ICP
+    correction keeps belief drift small and bounded regardless (0.013-0.1m in nearly every
+    trial, the SAME range as flat ground), confirming the lidar-based correction loop is not
+    measurably degraded by terrain-induced scan geometry distortion, and adds real, larger
+    value here than on flat ground precisely because there's more raw drift to correct. Task
+    outcomes stayed within Stage 4/5's own already-documented seed-to-seed terrain variability,
+    not a new localization-specific effect; see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1856,6 +1867,43 @@ closing diagnosis more strongly than before: the camera track's bottleneck is up
 localization, in the perception/mapping chain itself, and is now shown to affect even the
 simplest possible task, not just tight corners.
 
+### Stage 15: different dynamics -- SLAM localization on uneven terrain
+
+The first "move past the flat-ground island world" test, chosen for a concrete, previously-
+untested interaction rather than novelty for its own sake: Stage 13's lidar + ICP localization
+has only ever run on flat ground; Stage 4/5's uneven terrain has only ever run with
+ground-truth pose. `slam.mj_lidar.mj_lidar_scan` casts rays from a fixed height relative to
+`(x, y, yaw)`, implicitly assuming a level body -- terrain-induced pitch/roll (the base tilting
+as the robot steps over bumps) could in principle distort scan geometry in a way flat ground
+never exercises. `eval_localization_terrain.py` tests this directly: the terrain-trained
+checkpoint (`world_model_terrain.pt`), terrain amplitude 0.08 (Stage 4/5's own test value), the
+same 4 start/goal pairs, ground truth vs. noisy localization vs. noisy + `--icp-degeneracy-
+filter`, 3 seeds.
+
+**Result**: a genuinely positive finding, not another negative/mixed one. Raw (uncorrected)
+odometry drift is clearly WORSE on terrain than it ever is on flat ground -- up to 0.480-0.902m
+in several trials here, vs. flat ground's typical <0.3m -- consistent with terrain-induced body
+tilt perturbing the executed body-frame velocity the odometry integration reads (not a noise-
+model parameter change, the same odometry code, just noisier REAL input from bumpier ground).
+But belief (ICP-corrected) drift stayed small and bounded in nearly every trial regardless
+(0.013-0.102m) -- the SAME range Stage 13 established on flat ground, confirming the
+lidar-based correction isn't measurably thrown off by terrain-induced scan distortion, and
+is doing MORE useful work here than on flat ground precisely because there's more raw drift to
+correct away. The one trial that looked like an outlier (seed 301, detour A: only 7-8 lidar
+scans attempted) turned out to be an early terrain-induced fall, not a localization problem --
+the SAME fall point (final distance ~10.1-10.2m) occurs under ground-truth pose too.
+
+Task-level outcomes (reach counts: 3/12 ground truth, 4/12 noisy, 3/12 noisy+filter) moved
+around within the range Stage 4/5 ALREADY documented for terrain ("a single seed/episode can
+flip which checkpoint wins") -- not a new localization-specific effect, consistent with belief
+drift staying flat-ground-sized across the board.
+
+**Honest conclusion**: the one real, previously-untested hypothesis here (terrain-induced body
+tilt degrading lidar-based localization) came back negative in the useful direction -- it
+doesn't happen, at least not measurably at this terrain amplitude. The SLAM mechanism built on
+flat ground generalizes cleanly to this harder-dynamics environment, and the correction loop's
+value, if anything, INCREASES on terrain since there's a larger raw-drift gap for it to close.
+
 ## Repository layout
 
 ```
@@ -1940,6 +1988,9 @@ wam/
 ├── eval_pixel_slam.py                                               # Stage 14: multi-seed ground-truth vs. noisy-localization comparison
 │                                                                       # on the camera-only track -- localization integrates cleanly (small,
 │                                                                       # stable drift) but doesn't move the camera track's already-poor outcome
+├── eval_localization_terrain.py                                     # Stage 15: SLAM localization + Stage 4/5's uneven terrain, combined for
+│                                                                       # the first time -- terrain inflates raw odometry drift but ICP keeps
+│                                                                       # belief drift flat-ground-sized regardless; a genuinely positive result
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth

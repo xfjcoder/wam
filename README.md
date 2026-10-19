@@ -138,7 +138,9 @@ an existing one.
 13. **Replace ground-truth pose with a real, noisy/drifting SLAM belief pose** -- DONE (a
     clean, decisive positive result on the default feature-rich island world, but a follow-up
     stress test CONFIRMED the flagged sparse/aliased scope boundary is a real limitation, not
-    just caution -- see below).
+    just caution; `--icp-degeneracy-filter` then fixed the aliasing half of it cleanly (2-20x
+    less drift on every corridor trial) while the sparse/low-correspondence-count half stayed
+    a genuine partial -- see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1647,8 +1649,48 @@ silently make localization worse than no correction at all while still reporting
 "convergence". If this is picked up again, the right next step is a convergence-CONFIDENCE
 check (e.g. requiring `n_correspondences` well above `--icp-min-correspondences`, or rejecting
 corrections whose residual geometry is degenerate along one axis) before trusting an ICP
-result, not a different scan-matcher -- this wasn't built here since testing the boundary, not
-fixing it, was the ask.
+result, not a different scan-matcher.
+
+### Stage 13 addendum, continued: `--icp-degeneracy-filter` -- a real, scoped fix for the aliasing case
+
+The geometric half of the fix above IS built: `--icp-degeneracy-filter` re-examines the
+correspondence set `icp_2d`'s returned pose implies (a cheap one-shot nearest-neighbor
+re-query at that pose, not a second ICP run, keeping `slam.scan_match` completely unmodified)
+and computes the eigenvalues of the matched map points' own spread. A corner/varied-wall-angle
+match (the default island world) spreads points roughly isotropically -- eigenvalue ratio near
+1, correction trusted fully, exactly reproducing the original result. A straight wall spreads
+matched points almost entirely along its own length -- eigenvalue ratio near 0, so the
+correction's component along THAT axis is down-weighted toward the odometry prediction instead
+of applied, while the perpendicular (cross-wall) component, which IS constrained, stays at
+full confidence. Yaw is left untouched (a straight wall does constrain orientation -- rotating
+the scan increases residual sharply, unlike sliding along the wall).
+
+**Default-world regression check** (`eval_localization.py --with-degeneracy-filter`, same 4
+pairs/3 seeds): unaffected. 12/12 reached either way, belief drift bounds statistically the
+same with the filter on (0.014-0.044m) as off (0.031-0.045m) -- the filter is a no-op here, as
+intended, since corners/varied angles already give a near-isotropic match.
+
+**Corridor result -- a clean, decisive fix**: drift dropped 2-20x across all 6 corridor
+trials with the filter on vs. off (e.g. 1.627m -> 0.325m, 1.733m -> 0.835m, 0.935m -> 0.046m),
+and 5 of 6 trials now beat the raw-odometry baseline (vs. 0/6 before) -- the filter directly
+fixes the exact failure mode it targets.
+
+**Sparse-world result -- a genuine, honest partial**: mixed. The E-W "blind crossing" improved
+in most trials (one seed that previously fell now reaches the goal; drift dropped in the
+others too), but the N-S crossing -- already falling 3/3 seeds even under ground truth, a
+general task-difficulty problem, not a localization one -- showed no consistent pattern, with
+one trial's drift actually increasing slightly (0.224m -> 0.451m). This makes sense once
+named: the sparse-world failure mode isn't primarily geometric collinearity, it's a LOW
+correspondence COUNT after reacquiring a wall following a long blind stretch (near
+`--icp-min-correspondences`'s own floor) -- a different confidence signal than the one this
+filter checks. The "require `n_correspondences` well above the minimum" half of the original
+fix proposal is still open if the sparse case specifically is ever revisited.
+
+**Default stays off** (`--icp-degeneracy-filter`, not yet default-on): reproduces the exact
+original `--noisy-localization` behavior unless explicitly requested, same backward-
+compatibility convention every flag in this project follows. Turn it on whenever corridor-like
+or otherwise elongated/repetitive geometry is a concern; the default island world doesn't need
+it, and it's confirmed harmless there either way.
 
 ## Repository layout
 
@@ -1686,7 +1728,9 @@ wam/
 │                                     # (Stage 13: + --noisy-localization, a ported slam_sim Stage 4
 │                                     #  predict/correct/update SLAM loop -- belief_pose replaces
 │                                     #  ground truth for the grid/planner/A*; + --world-outer/
-│                                     #  --world-island to build sparser/aliased test worlds)
+│                                     #  --world-island to build sparser/aliased test worlds;
+│                                     #  + --icp-degeneracy-filter, the confirmed fix for the
+│                                     #  corridor-aliasing failure mode those worlds exposed)
 ├── eval_obstacles.py                 # Stage 3b: multi-seed A*-enabled vs. disabled comparison
 ├── eval_terrain.py                     # Stage 4: multi-seed flat-vs-terrain model comparison
 ├── eval_obstacles_terrain.py             # Stage 5: multi-seed obstacles+terrain comparison
@@ -1717,7 +1761,9 @@ wam/
 ├── eval_pixel_margins.py                                            # mini-plan reopened: A*/CEM safety-margin match test, negative
 ├── eval_pixel_control_authority.py                                  # mini-plan reopened: turn-rate cap test, negative
 ├── eval_localization.py                                             # Stage 13: multi-seed ground-truth vs. noisy-localization comparison
+│                                                                       # (+ --with-degeneracy-filter: confirms no regression on the default world)
 ├── eval_localization_sparse.py                                      # Stage 13 addendum: sparse/aliased-world stress test, confirms the limitation
+│                                                                       # (+ --with-degeneracy-filter: confirms the corridor-aliasing fix, 2-20x less drift)
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth

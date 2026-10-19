@@ -38,7 +38,19 @@ direction, same limitation any real lidar-mapping-then-planning stack has.
 The default world is slam_sim's own `World.loop_corridor()`: a 12x8m rectangle with a 4x4m
 island in the middle, open on all sides -- a straight line from one corner to the opposite
 corner is blocked by the island, so a goal across the diagonal forces genuine routing around
-it, not just goal-seeking in open space (Stage 2's eval_navigate.py trials).
+it, not just goal-seeking in open space (Stage 2's eval_navigate.py trials). `--world-outer`/
+`--world-island` (default unchanged) build other `World.loop_corridor()` sizes, used by
+`eval_localization_sparse.py` to stress-test Stage 13 on sparser/more degenerate geometries.
+
+That stress test confirmed a real failure mode: on a long straight corridor, icp_2d can
+report converged=True with a low, stable residual while still applying a WRONG along-corridor
+correction, because a straight wall's matched points constrain the perpendicular direction but
+not the direction parallel to the wall (the textbook point-cloud-registration aliasing case).
+`--icp-degeneracy-filter` is the fix: it re-examines the correspondence set ICP's returned
+pose implies, and down-weights the correction's component along the matched points' dominant
+(long) axis by that axis's own eigenvalue ratio -- full trust when the match is isotropic
+(corners, the default island world), near-zero trust along a collinear wall. Default off
+reproduces the original `--noisy-localization` behavior exactly.
 
 Usage (needs go1_rl_walk/mpc's own venv for mujoco/torch, and slam_sim importable as a
 sibling repo):
@@ -58,6 +70,7 @@ from pathlib import Path
 import mujoco as mj
 import numpy as np
 import torch
+from scipy.spatial import cKDTree
 
 GO1_RL_WALK = Path(__file__).resolve().parent.parent / "go1_rl_walk"
 SLAM_SIM = Path(__file__).resolve().parent.parent / "slam_sim"
@@ -72,7 +85,7 @@ from demo_stage6_go2_world import build_env_xml              # noqa: E402
 from slam.world import World                                 # noqa: E402
 from slam.occupancy_grid import OccupancyGrid                 # noqa: E402
 from slam.mj_lidar import mj_lidar_scan                        # noqa: E402
-from slam.scan_match import icp_2d, scan_to_local_points         # noqa: E402
+from slam.scan_match import icp_2d, scan_to_local_points, transform_points         # noqa: E402
 from slam.viz import render_frame, save_gif                     # noqa: E402
 
 from wam.model import WorldModel                            # noqa: E402
@@ -136,6 +149,22 @@ def main():
                               "matching real wheel/leg-odometry behavior).")
     parser.add_argument("--icp-max-correspondence-dist", type=float, default=0.5)
     parser.add_argument("--icp-min-correspondences", type=int, default=20)
+    parser.add_argument("--icp-degeneracy-filter", action="store_true",
+                         help="Stage 13 addendum's confirmed fix target: icp_2d can report "
+                              "converged=True with a near-zero residual while still being "
+                              "wrong, when the matched map points are nearly collinear (e.g. "
+                              "a long straight corridor wall) -- the correction is genuinely "
+                              "unconstrained along that line's direction, not just noisy. "
+                              "When set, re-examines the correspondence set ICP's returned "
+                              "pose implies, and down-weights the component of the position "
+                              "correction along the matched points' dominant (long) axis by "
+                              "its eigenvalue ratio to the perpendicular axis -- full trust "
+                              "when the match is isotropic (corners, varied wall angles, the "
+                              "default island world), near-zero trust along a collinear "
+                              "wall's own direction (falls back to the odometry prediction "
+                              "for THAT axis only, same as an unconverged scan already does "
+                              "for the whole correction). Default off reproduces the original "
+                              "--noisy-localization behavior exactly.")
     parser.add_argument("--terrain-amplitude-max", type=float, default=0.0,
                          help="Stage 4/5: (0, max) m peak-to-peak random bumps added to the "
                               "island world's ground, resampled at env reset -- 0.0 (default) "
@@ -347,8 +376,39 @@ def main():
                     local_pts, map_pts, (pred_x, pred_y, pred_yaw),
                     max_correspondence_dist=args.icp_max_correspondence_dist,
                     min_correspondences=args.icp_min_correspondences)
-                belief_x, belief_y, belief_yaw = (
-                    corrected if converged else (pred_x, pred_y, pred_yaw))
+
+                if converged and args.icp_degeneracy_filter:
+                    # icp_2d's own residual/convergence check has no way to tell "confidently
+                    # right" from "confidently wrong along an unconstrained axis" -- a long
+                    # straight wall gives a low, stable residual regardless of where along the
+                    # wall the match lands. Re-examine what it actually matched: a quick,
+                    # cheap one-shot re-query at the returned pose (not a second ICP run) finds
+                    # the same correspondence set its last iteration converged on.
+                    world_pts = transform_points(local_pts, corrected)
+                    dists, idx = cKDTree(map_pts).query(world_pts)
+                    valid = dists < args.icp_max_correspondence_dist
+                    matched = map_pts[idx[valid]]
+                    centered = matched - matched.mean(axis=0)
+                    eigvals, eigvecs = np.linalg.eigh(np.cov(centered.T))
+                    # ascending order: eigvals[0] <= eigvals[1]. A corner/varied-angle match
+                    # (the default island world) spreads matched points roughly isotropically
+                    # (ratio near 1, trust the correction fully). A straight wall spreads them
+                    # almost entirely along its own length (ratio near 0): the correction
+                    # component along THAT axis is genuinely unconstrained by this scan, not
+                    # just noisy, so it's down-weighted toward the odometry prediction instead
+                    # of trusted -- the perpendicular (cross-wall) component, which IS
+                    # constrained, is kept at full confidence either way.
+                    eccentricity = eigvals[0] / (eigvals[1] + 1e-9)
+                    v_minor, v_major = eigvecs[:, 0], eigvecs[:, 1]
+                    delta = np.array([corrected[0] - pred_x, corrected[1] - pred_y])
+                    delta_filtered = ((delta @ v_minor) * v_minor
+                                      + eccentricity * (delta @ v_major) * v_major)
+                    belief_x = pred_x + delta_filtered[0]
+                    belief_y = pred_y + delta_filtered[1]
+                    belief_yaw = corrected[2]
+                else:
+                    belief_x, belief_y, belief_yaw = (
+                        corrected if converged else (pred_x, pred_y, pred_yaw))
                 n_icp_attempts += 1
                 n_icp_converged += int(converged)
                 belief_trail.append([belief_x, belief_y])

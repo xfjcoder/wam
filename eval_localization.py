@@ -29,7 +29,8 @@ PAIRS = [
 ]
 
 
-def run_one(start_x, start_y, goal_x, goal_y, seed, seconds, noisy_localization):
+def run_one(start_x, start_y, goal_x, goal_y, seed, seconds, noisy_localization,
+            degeneracy_filter=False):
     cmd = ["/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3",
            str(Path(__file__).resolve().parent / "navigate_wam_obstacles.py"),
            "--start-x", str(start_x), "--start-y", str(start_y),
@@ -37,6 +38,8 @@ def run_one(start_x, start_y, goal_x, goal_y, seed, seconds, noisy_localization)
            "--seed", str(seed), "--seconds", str(seconds)]
     if noisy_localization:
         cmd.append("--noisy-localization")
+    if degeneracy_filter:
+        cmd.append("--icp-degeneracy-filter")
     out = subprocess.run(cmd, capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent))
     text = out.stdout + out.stderr
 
@@ -62,17 +65,25 @@ def main():
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--base-seed", type=int, default=100)
     ap.add_argument("--seconds", type=float, default=45.0)
+    ap.add_argument("--with-degeneracy-filter", action="store_true",
+                     help="add a third condition -- noisy localization WITH "
+                          "--icp-degeneracy-filter -- to confirm the fix doesn't regress "
+                          "the default island world's already-good result.")
     args = ap.parse_args()
 
-    for noisy_localization, label in [(False, "GROUND-TRUTH POSE (original)"),
-                                       (True, "NOISY LOCALIZATION (Stage 13 belief pose)")]:
+    conditions = [(False, False, "GROUND-TRUTH POSE (original)"),
+                  (True, False, "NOISY LOCALIZATION (Stage 13 belief pose)")]
+    if args.with_degeneracy_filter:
+        conditions.append((True, True, "NOISY LOCALIZATION + --icp-degeneracy-filter"))
+
+    for noisy_localization, degeneracy_filter, label in conditions:
         print(f"=== {label} ===")
         for name, sx, sy, gx, gy in PAIRS:
             results = []
             for i in range(args.seeds):
                 seed = args.base_seed + i
                 status, t, final_dist, drift = run_one(
-                    sx, sy, gx, gy, seed, args.seconds, noisy_localization)
+                    sx, sy, gx, gy, seed, args.seconds, noisy_localization, degeneracy_filter)
                 results.append((seed, status, t, final_dist, drift))
             summary = ", ".join(
                 f"seed={s}:{st}" + (f"@{t:.1f}s" if t is not None else f"(d={d:.2f}m)")

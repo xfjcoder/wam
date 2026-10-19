@@ -149,6 +149,15 @@ an existing one.
     the same class step 18 fixed in
     `navigate_wam_pixel.py`, that had silently affected every multi-seed eval run through this
     script since Stage 3b).
+14. **Combine Stage 12's camera track with Stage 13's SLAM track** -- DONE (`navigate_wam_pixel_
+    slam.py`: the localization integration itself is clean -- belief drift stays small
+    (0.001-0.16m) throughout every trial, same order of magnitude as Stage 13's own standalone
+    numbers -- but it doesn't move the camera track's already-poor task outcome in either
+    direction; ground truth, noisy localization, and noisy+filter all land in the same narrow,
+    bad range (1-2/12 reached). A genuinely new, honest finding along the way: the camera
+    track's failure isn't corner-specific after all -- it mostly fails even the straight
+    "no obstacle" pair under PERFECT pose, extending Stage 12's own closure finding past the
+    scope it was originally measured in; see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1797,6 +1806,56 @@ stays `0` (off), same convention as every flag in this project; worth preferring
 `--icp-confidence-margin` if this regime is ever revisited in earnest, though neither is a
 complete answer to the underlying "ICP has nothing to work with for 10+ meters" problem.
 
+### Stage 14: combining Stage 12's camera track and Stage 13's SLAM track
+
+Two tracks built independently up to here, never tested together: Stage 12's camera-only
+obstacle sensing (`navigate_wam_pixel.py`, always assumed ground-truth pose) and Stage 13's
+lidar + ICP localization (`navigate_wam_obstacles.py`, always used the SAME lidar-built grid
+for both localization and obstacle costing). `navigate_wam_pixel_slam.py` splits the two
+sensing roles the way they'd realistically split on a robot carrying both sensors: a private
+`lidar_grid` for localization ONLY (Stage 13's exact mechanism, including the confirmed
+`--icp-degeneracy-filter` fix), and a separate `cam_grid` for obstacle-sensing/A*/CEM cost ONLY
+(Stage 12's exact mechanism) -- now updated and planned against the SLAM belief pose instead of
+ground truth. Verified byte-identical to `navigate_wam_pixel.py`'s own output when
+`--noisy-localization` is off and the same checkpoints are used -- the restructuring itself
+changes nothing.
+
+**The motivating question had a floor-effect problem going in**: Stage 12 closed with
+closed-loop navigation never reaching its corner-stall goal even under perfect pose (0/5 across
+two separate tuning hypotheses, both negative) -- there's no room to measure "does SLAM noise
+make it worse" when the baseline is already at zero. `eval_pixel_slam.py` ran the SAME 4
+start/goal pairs `eval_localization.py`/`eval_obstacles.py` use (3 seeds, ground truth vs.
+noisy localization vs. noisy + `--icp-degeneracy-filter`) to see how far that floor extends and
+whether the combination costs anything measurable regardless:
+
+- **The floor extends further than Stage 12 ever measured**: even the trivial "no obstacle"
+  straight-line pair -- no routing, no corners, nothing Stage 12's corner-stall diagnosis was
+  about -- mostly fails under GROUND-TRUTH pose with this track (1/3 reached). A genuinely new
+  finding: the camera-derived perception/mapping problem Stage 12 narrowed to "near corners" is
+  not corner-specific at all; it's a pervasive reliability problem with this particular
+  checkpoint/cost-head combination, not something `--icp-degeneracy-filter` or any localization
+  fix was ever going to touch.
+- **The localization half of the combination works cleanly**: belief drift stayed small
+  (0.001-0.16m) in every one of the 36 trials run across all three conditions, the same order
+  of magnitude as Stage 13's own standalone default-world numbers, and ICP convergence stayed
+  high throughout (as low as 100/300-ish scans only on the longest-running falls/timeouts, same
+  pattern Stage 13 already established). The SLAM mechanism itself is unaffected by being
+  wired into a different (camera-based) planning loop.
+- **The combination doesn't move the outcome in either direction**: reached counts were 1/12
+  (ground truth), 2/12 (noisy localization), 1/12 (noisy + filter) across all 4 pairs -- the
+  same narrow, bad range regardless of condition, well within what 3-seed noise alone could
+  produce. Detour A/B/C stayed at 0/9 reached in every condition tried.
+
+**Honest conclusion**: the two tracks integrate cleanly as a software/sensor-fusion matter --
+no crashes, no localization blow-ups, no interaction effect between the two grids -- but the
+combination doesn't rescue Stage 12's camera track, nor does adding realistic SLAM noise make
+an already badly-failing system meaningfully worse, because the camera-perception/mapping
+problem is simply much larger than anything localization-level noise contributes on this world
+(where Stage 13 already showed ICP drift stays under ~0.2m). This confirms Stage 12's own
+closing diagnosis more strongly than before: the camera track's bottleneck is upstream of
+localization, in the perception/mapping chain itself, and is now shown to affect even the
+simplest possible task, not just tight corners.
+
 ## Repository layout
 
 ```
@@ -1875,6 +1934,12 @@ wam/
 │                                                                       # (+ --with-degeneracy-filter: confirms no regression on the default world)
 ├── eval_localization_sparse.py                                      # Stage 13 addendum: sparse/aliased-world stress test, confirms the limitation
 │                                                                       # (+ --with-degeneracy-filter: confirms the corridor-aliasing fix, 2-20x less drift)
+├── navigate_wam_pixel_slam.py                                       # Stage 14: combines Stage 12's camera track + Stage 13's SLAM track --
+│                                                                       # private lidar grid for localization only, separate camera grid for
+│                                                                       # obstacle-sensing/A*/CEM cost only, both driven by the same belief pose
+├── eval_pixel_slam.py                                               # Stage 14: multi-seed ground-truth vs. noisy-localization comparison
+│                                                                       # on the camera-only track -- localization integrates cleanly (small,
+│                                                                       # stable drift) but doesn't move the camera track's already-poor outcome
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth

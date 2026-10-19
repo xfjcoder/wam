@@ -119,6 +119,16 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
+    # Same bug class Stage 12 step 18 and Stage 13's own seeding-bug-fix commit found
+    # independently (CEMPlanner's own torch.randn candidate sampling is never seeded by
+    # anything else) -- found a third time while building navigate_wam_moving_obstacle_slam.py
+    # and confirmed it also affects THIS script (and navigate_wam_moving_obstacle.py), never
+    # ported back here when first fixed elsewhere. Means every Stage 10/11 multi-seed/phase
+    # eval ever run through this script partly measured CEM sampling noise alongside whatever
+    # was actually being tested -- see README Stage 8/9/10/11 re-verification note.
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model = WorldModel(STATE_DIM, ACTION_DIM, hidden=ckpt["hidden"], n_hidden=ckpt["n_hidden"])
     model.load_state_dict(ckpt["model_state"])

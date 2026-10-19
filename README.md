@@ -169,6 +169,27 @@ an existing one.
     value here than on flat ground precisely because there's more raw drift to correct. Task
     outcomes stayed within Stage 4/5's own already-documented seed-to-seed terrain variability,
     not a new localization-specific effect; see below).
+16. **SLAM localization combined with a moving obstacle** -- DONE (hypothesis tested and
+    REFUTED, but a genuine, independent finding surfaced along the way:
+    `navigate_wam_moving_obstacle_slam.py` combines Stage 8/9's moving-obstacle tracker with
+    Stage 13's noisy/drifting SLAM belief pose for the first time. Motivating hypothesis: the
+    tracker classifies live occupied cells as static-vs-dynamic against a ground-truth static
+    reference map, so belief-pose drift could make a genuinely static wall cell land far enough
+    from its true position to be misclassified as a spurious "ghost" dynamic obstacle. Measured
+    directly via a new `max_tracks_seen` diagnostic (there's only ever ONE real obstacle, so
+    >1 is an unambiguous ghost): ghost tracks appeared at essentially the SAME low rate (1/8)
+    under ground-truth pose as under noisy localization -- the hypothesis is refuted, this isn't
+    a localization-driven effect. What it IS, confirmed by tracing the ground-truth ghost trial
+    directly: Stage 10's own previously-"fixed" static-reference-sparsity bug (a zero-velocity
+    ghost at a fixed position the vantage-point scan's finite spacing missed), recurring at a
+    different wall location in this single-obstacle scenario -- Stage 10's fix reduced, but
+    didn't eliminate, this class of residual error. Harmless to task outcome in every trial
+    tested (24/24 reached, 0 falls, 0 timeouts, all three conditions); belief drift stayed in
+    the same small range (0.019-0.045m) Stage 13 established on this world. Also found (a third
+    instance) and fixed the same unseeded-CEM-sampling bug Stage 12/13 found independently in
+    `navigate_wam_pixel.py`/`navigate_wam_obstacles.py`, this time in
+    `navigate_wam_moving_obstacle.py`/`navigate_wam_multi_obstacle.py` -- re-verified Stage 8's
+    own headline conclusion still holds with proper seeding; see below.
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1904,6 +1925,80 @@ doesn't happen, at least not measurably at this terrain amplitude. The SLAM mech
 flat ground generalizes cleanly to this harder-dynamics environment, and the correction loop's
 value, if anything, INCREASES on terrain since there's a larger raw-drift gap for it to close.
 
+### Stage 16: SLAM localization combined with a moving obstacle
+
+Another previously-untested pairing, chosen with a specific, falsifiable hypothesis rather than
+just "combine two more things": Stage 8/9's `DynamicObstacleTracker` (see `wam/obstacle_tracker.py`)
+classifies a live lidar-sensed occupied cell as static-vs-dynamic by checking its distance to a
+ONE-TIME reference map, built from GROUND TRUTH (a scan of the environment's known geometry with
+no obstacle present, an assumed "known floor plan" prior Stage 9 already documents). Under Stage
+13's `--noisy-localization`, the LIVE occupancy grid gets built from the drifting/corrected
+`belief_pose` instead -- so even a genuinely static wall cell could get written into the live map
+at a slightly wrong world-frame location, possibly far enough from the ground-truth static
+reference to fall outside the tracker's `match_radius` (0.25m) and get misclassified as a new,
+unexplained, "must be the obstacle" ghost. That's a concrete, previously-impossible-to-test
+failure mode (Stage 8/9/10 never ran under anything but perfect pose), tested on the default
+island world first (deliberately, before any harder/sparser world) to isolate this NEW
+interaction from problems the sparser Stage 13-addendum worlds already have of their own.
+
+`navigate_wam_moving_obstacle_slam.py` ports Stage 13's odometry-noise + ICP-correction block
+onto Stage 8/9's single-moving-obstacle navigator, using ONE shared occupancy grid for both
+localization and obstacle tracking (unlike Stage 14's two-grid split, which was splitting two
+different SENSORS -- here it's one sensor, lidar, serving two roles, exactly as Stage 13 already
+used it). It adds one new diagnostic not present upstream: `max_tracks_seen`, the largest number
+of SIMULTANEOUS dynamic tracks reported in an episode -- since there's only ever ONE real moving
+obstacle in this scenario, any value above 1 is a direct, unambiguous ghost-track signal, not
+something that has to be inferred from task outcome. `eval_moving_obstacle_slam.py` runs the
+same 8-phase/seed protocol `eval_moving_obstacle.py` established for Stage 8, across 3
+conditions (ground truth, noisy localization, noisy + `--icp-degeneracy-filter`).
+
+**A real bug found first, before the main result**: verifying this script's `--noisy-localization
+off` smoke test reproduced `navigate_wam_moving_obstacle.py` byte-for-byte surfaced a THIRD
+instance of the unseeded-CEM-sampling bug Stage 12 step 18 and Stage 13's own seeding-bug-fix
+commit each found independently in `navigate_wam_pixel.py` and `navigate_wam_obstacles.py` --
+`navigate_wam_moving_obstacle.py` (and, checked and fixed at the same time, the sibling
+`navigate_wam_multi_obstacle.py`) never got the `torch.manual_seed(args.seed)` fix ported back to
+them, so every Stage 8/9/10/11 multi-seed/phase eval ever run through these two scripts partly
+measured CEM sampling noise alongside whatever was actually being tested -- confirmed directly
+(re-running the same `--seed`/`--obstacle-phase` pair twice gave different final distances/lidar
+-scan counts before the fix, identical after). Fixed in both scripts; re-ran Stage 8's own
+`eval_moving_obstacle.py` baseline with proper seeding now in place: **the headline conclusion
+holds** (obstacle cost is still load-bearing -- 8/8 reached with it enabled, 0 falls) but the
+disabled-condition fall count came out lower than originally reported (2/8 fell vs. the original
+run's 4/8) now that CEM noise isn't confounding which seeds get unlucky -- same conclusion,
+different exact numbers, an instance of the same "always use the project's own multi-seed eval,
+never a single run" discipline this bug class keeps reinforcing. `eval_multi_obstacle.py`
+(Stage 10) was NOT separately re-verified with the fix -- flagged as an open, low-priority item
+if that stage's own numbers are ever revisited.
+
+**Main result: the localization-drift-ghosting hypothesis is REFUTED.** Ghost tracks
+(`max_tracks_seen > 1`) appeared in 1/8 ground-truth trials, 0/8 noisy-localization trials, and
+1/8 noisy+filter trials -- statistically indistinguishable rates across all three conditions,
+not concentrated in the noisy-localization condition the hypothesis predicted. Task outcomes
+were a clean 8/8 reached, 0 falls, 0 timeouts in EVERY condition, and belief drift stayed in the
+same small range (0.019-0.045m) Stage 13 already established on this world -- the combination
+integrates with no measurable cost at all, not even the "integrates fine but doesn't help"
+pattern Stage 14/15 both found.
+
+**But the ghost track itself is real, and its root cause was traced, not left as a mystery**:
+re-running the ground-truth seed=306/phase=4.71 trial with `--verbose` (at the EXACT phase value
+the eval used, not its 2-decimal printed rounding -- the first reproduction attempt using the
+rounded value silently missed the ghost entirely, a reminder that these eval scripts print
+rounded summaries but pass full-precision floats to the subprocess) shows a second track sitting
+at a FIXED position with ZERO velocity for the entire time it's tracked, while the first track's
+position/velocity clearly follow the real moving obstacle -- the exact signature Stage 10
+documented for its own static-reference-sparsity bug (a wall cell the vantage-point scan's finite
+spacing failed to see from some angle). Stage 10's fix (denser 0.6m vantage spacing, wider 0.9m
+cluster radius -- both already the defaults this script inherits) reduced this failure mode but
+evidently didn't eliminate it everywhere; it recurred here at a different wall location, in a
+different (single-obstacle) scenario than the one Stage 10 itself tested. **Honest conclusion**:
+this is a genuine, independent finding surfaced as a side effect of testing an unrelated
+hypothesis, not something to re-chase right now -- it's rare (~1/8), harmless to every task
+outcome measured, and already has a known, scoped fix direction if revisited (denser still
+vantage sampling, or a confidence check on a track's own sighting count before trusting it as
+real, mirroring Stage 13's own confidence-check lineage for ICP correspondences). Don't re-open
+Stage 10 over this without new evidence it matters for an actual outcome.
+
 ## Repository layout
 
 ```
@@ -1991,6 +2086,12 @@ wam/
 ├── eval_localization_terrain.py                                     # Stage 15: SLAM localization + Stage 4/5's uneven terrain, combined for
 │                                                                       # the first time -- terrain inflates raw odometry drift but ICP keeps
 │                                                                       # belief drift flat-ground-sized regardless; a genuinely positive result
+├── navigate_wam_moving_obstacle_slam.py                             # Stage 16: SLAM localization + Stage 8/9's moving-obstacle tracker,
+│                                                                       # combined for the first time -- one shared grid for both localization
+│                                                                       # and obstacle tracking; adds a max_tracks_seen ghost-track diagnostic
+├── eval_moving_obstacle_slam.py                                     # Stage 16: multi-phase 3-condition comparison -- ghost-track rate is
+│                                                                       # statistically the SAME under ground truth and noisy localization
+│                                                                       # (hypothesis refuted); the ghost itself is Stage 10's own residual bug
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth

@@ -57,7 +57,7 @@ SCENARIOS = [
 
 
 def run_one(world_outer, world_island, start_x, start_y, goal_x, goal_y, seed, seconds,
-            noisy_localization, degeneracy_filter=False):
+            noisy_localization, degeneracy_filter=False, confidence_margin=0.0):
     cmd = ["/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3",
            str(Path(__file__).resolve().parent / "navigate_wam_obstacles.py"),
            "--world-outer", str(world_outer[0]), str(world_outer[1]),
@@ -70,6 +70,8 @@ def run_one(world_outer, world_island, start_x, start_y, goal_x, goal_y, seed, s
         cmd.append("--noisy-localization")
     if degeneracy_filter:
         cmd.append("--icp-degeneracy-filter")
+    if confidence_margin > 0:
+        cmd += ["--icp-confidence-margin", str(confidence_margin)]
     out = subprocess.run(cmd, capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent))
     text = out.stdout + out.stderr
 
@@ -99,16 +101,24 @@ def main():
                      help="add a third condition -- noisy localization WITH "
                           "--icp-degeneracy-filter -- to test the fix against the exact "
                           "degenerate geometries that motivated it.")
+    ap.add_argument("--with-confidence-margin", type=float, default=0.0,
+                     help="add a fourth condition -- noisy localization WITH "
+                          "--icp-degeneracy-filter AND --icp-confidence-margin set to this "
+                          "value -- to test the count-based confidence check against the "
+                          "sparse-world low-correspondence-count case it specifically targets.")
     args = ap.parse_args()
 
-    conditions = [(False, False, "GROUND-TRUTH POSE"),
-                  (True, False, "NOISY LOCALIZATION (Stage 13 belief pose)")]
+    conditions = [(False, False, 0.0, "GROUND-TRUTH POSE"),
+                  (True, False, 0.0, "NOISY LOCALIZATION (Stage 13 belief pose)")]
     if args.with_degeneracy_filter:
-        conditions.append((True, True, "NOISY LOCALIZATION + --icp-degeneracy-filter"))
+        conditions.append((True, True, 0.0, "NOISY LOCALIZATION + --icp-degeneracy-filter"))
+    if args.with_confidence_margin > 0:
+        conditions.append((True, True, args.with_confidence_margin,
+                            f"NOISY LOCALIZATION + filter + confidence-margin={args.with_confidence_margin:.0f}"))
 
     for scenario_name, world_outer, world_island, pairs in SCENARIOS:
         print(f"##### scenario: {scenario_name}  outer={world_outer} island={world_island} #####")
-        for noisy_localization, degeneracy_filter, label in conditions:
+        for noisy_localization, degeneracy_filter, confidence_margin, label in conditions:
             print(f"=== {label} ===")
             for name, sx, sy, gx, gy in pairs:
                 results = []
@@ -116,7 +126,7 @@ def main():
                     seed = args.base_seed + i
                     status, t, final_dist, drift = run_one(
                         world_outer, world_island, sx, sy, gx, gy, seed, args.seconds,
-                        noisy_localization, degeneracy_filter)
+                        noisy_localization, degeneracy_filter, confidence_margin)
                     results.append((seed, status, t, final_dist, drift))
                 summary = ", ".join(
                     f"seed={s}:{st}" + (f"@{t:.1f}s" if t is not None else f"(d={d:.2f}m)")

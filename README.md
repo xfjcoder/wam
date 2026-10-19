@@ -138,9 +138,13 @@ an existing one.
 13. **Replace ground-truth pose with a real, noisy/drifting SLAM belief pose** -- DONE (a
     clean, decisive positive result on the default feature-rich island world, but a follow-up
     stress test CONFIRMED the flagged sparse/aliased scope boundary is a real limitation, not
-    just caution; `--icp-degeneracy-filter` then fixed the aliasing half of it cleanly (2-20x
-    less drift on every corridor trial) while the sparse/low-correspondence-count half stayed
-    a genuine partial -- see below).
+    just caution; `--icp-degeneracy-filter` then fixed the aliasing half of it cleanly (every
+    corridor trial improved, including turning one outright fall into a clean reach) while a
+    count-based `--icp-confidence-margin` built for the remaining sparse/low-correspondence-
+    count half came back genuinely mixed once measured cleanly -- see below. Also: found and
+    fixed a reused CEM-sampling seeding bug, the same class step 18 fixed in
+    `navigate_wam_pixel.py`, that had silently affected every multi-seed eval run through this
+    script since Stage 3b).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1698,6 +1702,59 @@ compatibility convention every flag in this project follows. Turn it on whenever
 or otherwise elongated/repetitive geometry is a concern; the default island world doesn't need
 it, and it's confirmed harmless there either way.
 
+### Stage 13 addendum, closed out: a reused seeding bug, and `--icp-confidence-margin`'s honest result
+
+Partway through building the count-based confidence check the sparse-world result above calls
+for, two nominally-identical eval runs for the same corridor seed/pair produced different
+drift numbers that the new flag couldn't explain (`n_valid` on that corridor is always ~410-430,
+far above any realistic margin threshold). The cause: `navigate_wam_obstacles.py` never called
+`torch.manual_seed(args.seed)` -- the exact same bug step 18 found and fixed in the sibling
+script `navigate_wam_pixel.py` (both share the same `wam/planner.py` `CEMPlanner`, with its own
+unseeded `torch.randn` candidate sampling), just never ported back here. `--seed` had only ever
+controlled env/numpy randomness in this script, not CEM's own sampling -- meaning every
+multi-seed eval run through `navigate_wam_obstacles.py` since Stage 3b (including every number
+quoted above) partly measured CEM sampling noise alongside whatever was actually being tested.
+Fixed with the same guard `navigate_wam_pixel.py` uses; verified by running an identical command
+twice and getting byte-identical output.
+
+All three comparisons above were re-run with the fix in place to get trustworthy final numbers:
+
+- **Default island world**: unchanged conclusion. `--icp-degeneracy-filter` is still a true
+  no-op (drift bounds the same, within noise, filter on vs. off), and `--icp-confidence-margin
+  50` on top of it produced byte-identical output to the filter alone in every one of the 12
+  trials -- confirming it's a true no-op here too, exactly as predicted (`n_valid` is always
+  ~137-372, nowhere near the margin's effective range).
+- **Corridor**: the fix's own result got, if anything, MORE decisive with proper seeding. The
+  unfiltered baseline now shows an outright fall that the earlier (confounded) measurement
+  hadn't caught (top corridor, seed 101: belief drift 2.917m, fell 0.99m short) -- and
+  `--icp-degeneracy-filter` fixes it (same seed, same world: belief drift 0.732m, reached
+  cleanly). Across all 6 trials, drift with the filter on ranged 0.143-0.732m vs. 0.544-2.917m
+  off -- a clean win, 6/6 reaches with the filter vs. 5/6 without. `--icp-confidence-margin 50`
+  again added nothing on top (byte-identical to filter-alone output) -- expected, since this
+  corridor's `n_valid` never drops anywhere near the margin's threshold either.
+- **Sparse**: this is the scenario the confidence margin specifically targets, and here the
+  cleanly-measured result is genuinely mixed, not a win. On the E-W "blind crossing," adding
+  the margin on top of the filter flipped two previously-successful seeds to falls while fixing
+  a third (net: still only 1/3 reaching, just a different seed) -- not an improvement, a
+  lateral shuffle. On the N-S crossing (already failing 3/3 under ground truth -- a
+  task-difficulty problem, not a localization one), final fall distances moved around with no
+  consistent direction under the margin (one trial notably worse, two notably better in meters
+  of distance-to-goal, none actually reaching). Unlike the geometric filter, a scalar
+  confidence margin scaling the WHOLE correction doesn't cleanly fix a low-correspondence
+  reacquisition after a long blind stretch -- the three or so matched points at that moment
+  can themselves be an unlucky or lucky sample, and down-weighting the correction uniformly
+  doesn't fix that variance, it just moves which seeds get unlucky.
+
+**Honest conclusion**: `--icp-degeneracy-filter` is the one confirmed, clean win from this
+entire addendum -- it directly and reliably fixes the along-corridor aliasing failure mode it
+was built for, with proper multi-seed verification now backing it up. `--icp-confidence-margin`
+remains available (default `0.0`, off) but is NOT a proven fix for the sparse/low-
+correspondence-count case; the honest, measured result is a wash. If the sparse-world blind-
+crossing case is revisited again, the right next step is probably not a smarter correction
+scalar but a different fallback entirely for that regime -- e.g. holding the prior belief
+(trusting odometry alone, no ICP correction at all) once `n_valid` drops below some hard floor,
+rather than trying to tune how much of a statistically-unreliable correction to trust.
+
 ## Repository layout
 
 ```
@@ -1736,7 +1793,11 @@ wam/
 │                                     #  ground truth for the grid/planner/A*; + --world-outer/
 │                                     #  --world-island to build sparser/aliased test worlds;
 │                                     #  + --icp-degeneracy-filter, the confirmed fix for the
-│                                     #  corridor-aliasing failure mode those worlds exposed)
+│                                     #  corridor-aliasing failure mode those worlds exposed;
+│                                     #  + --icp-confidence-margin, a count-based check that
+│                                     #  came back genuinely mixed, not a proven fix; also:
+│                                     #  fixed a reused CEM-sampling seeding bug, same class as
+│                                     #  step 18's fix in navigate_wam_pixel.py)
 ├── eval_obstacles.py                 # Stage 3b: multi-seed A*-enabled vs. disabled comparison
 ├── eval_terrain.py                     # Stage 4: multi-seed flat-vs-terrain model comparison
 ├── eval_obstacles_terrain.py             # Stage 5: multi-seed obstacles+terrain comparison

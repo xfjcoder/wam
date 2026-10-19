@@ -165,6 +165,18 @@ def main():
                               "for THAT axis only, same as an unconverged scan already does "
                               "for the whole correction). Default off reproduces the original "
                               "--noisy-localization behavior exactly.")
+    parser.add_argument("--icp-confidence-margin", type=float, default=0.0,
+                         help="Only used together with --icp-degeneracy-filter (0, the "
+                              "default, disables it): confirmed directly that per-scan "
+                              "correction magnitude grows noticeably as the correspondence "
+                              "count (n_valid) shrinks toward --icp-min-correspondences's own "
+                              "floor, in a sparse map independent of the geometric-degeneracy "
+                              "check above (a small but non-collinear correspondence set can "
+                              "still be statistically unreliable). Scales the WHOLE correction "
+                              "by how far n_valid is above that floor, ramping to full trust "
+                              "this many correspondences above it -- e.g. 50 means a 70-point "
+                              "match (20+50) is fully trusted, a 20-point match is not trusted "
+                              "at all (falls back to the odometry prediction).")
     parser.add_argument("--terrain-amplitude-max", type=float, default=0.0,
                          help="Stage 4/5: (0, max) m peak-to-peak random bumps added to the "
                               "island world's ground, resampled at env reset -- 0.0 (default) "
@@ -195,6 +207,18 @@ def main():
                               "World.loop_corridor() -- default reproduces the original "
                               "4x4m island exactly.")
     args = parser.parse_args()
+
+    # Stage 12 step 18 found and fixed this exact bug in navigate_wam_pixel.py (CEMPlanner's
+    # own torch.randn candidate sampling was never seeded anywhere -- confirmed there by
+    # re-running an identical --seed and getting a DIFFERENT final distance) but it was never
+    # ported back here, even though CEMPlanner (wam/planner.py) is the SAME shared module both
+    # scripts use. Found again independently while cross-checking two --icp-degeneracy-filter
+    # eval runs that should have been identical for a corridor pair whose n_valid never drops
+    # near --icp-confidence-margin's threshold (so the margin couldn't explain the difference)
+    # and weren't -- confirming every multi-seed eval ever run through this script (Stage 3b
+    # onward) partly measured CEM sampling noise alongside whatever was actually being tested.
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
 
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model = WorldModel(STATE_DIM, ACTION_DIM, hidden=ckpt["hidden"], n_hidden=ckpt["n_hidden"])
@@ -372,7 +396,7 @@ def main():
 
                 local_pts = scan_to_local_points(ranges, hit, angles)
                 map_pts = grid.occupied_points(threshold=args.occ_threshold)
-                corrected, converged, _ = icp_2d(
+                corrected, converged, n_valid_icp = icp_2d(
                     local_pts, map_pts, (pred_x, pred_y, pred_yaw),
                     max_correspondence_dist=args.icp_max_correspondence_dist,
                     min_correspondences=args.icp_min_correspondences)
@@ -403,6 +427,20 @@ def main():
                     delta = np.array([corrected[0] - pred_x, corrected[1] - pred_y])
                     delta_filtered = ((delta @ v_minor) * v_minor
                                       + eccentricity * (delta @ v_major) * v_major)
+                    if args.icp_confidence_margin > 0:
+                        # The OTHER half of the confidence check: a sparse map can hand back
+                        # a small, isotropic-LOOKING correspondence set (e.g. a short wall
+                        # segment just reacquired after a long blind stretch) that isn't
+                        # geometrically degenerate, just statistically unreliable from too few
+                        # points -- confirmed directly, per-scan correction magnitude grows
+                        # noticeably as n_valid shrinks toward --icp-min-correspondences's own
+                        # floor. Scale the WHOLE correction (both axes) by how far n_valid is
+                        # above that floor, ramping to full trust `icp_confidence_margin`
+                        # correspondences above it.
+                        count_confidence = float(np.clip(
+                            (n_valid_icp - args.icp_min_correspondences)
+                            / args.icp_confidence_margin, 0.0, 1.0))
+                        delta_filtered = delta_filtered * count_confidence
                     belief_x = pred_x + delta_filtered[0]
                     belief_y = pred_y + delta_filtered[1]
                     belief_yaw = corrected[2]

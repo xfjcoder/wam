@@ -30,7 +30,7 @@ PAIRS = [
 
 
 def run_one(start_x, start_y, goal_x, goal_y, seed, seconds, noisy_localization,
-            degeneracy_filter=False):
+            degeneracy_filter=False, confidence_margin=0.0):
     cmd = ["/home/cstu/robo/go1_rl_walk/mpc/venv/bin/python3",
            str(Path(__file__).resolve().parent / "navigate_wam_obstacles.py"),
            "--start-x", str(start_x), "--start-y", str(start_y),
@@ -40,6 +40,8 @@ def run_one(start_x, start_y, goal_x, goal_y, seed, seconds, noisy_localization,
         cmd.append("--noisy-localization")
     if degeneracy_filter:
         cmd.append("--icp-degeneracy-filter")
+    if confidence_margin > 0:
+        cmd += ["--icp-confidence-margin", str(confidence_margin)]
     out = subprocess.run(cmd, capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent))
     text = out.stdout + out.stderr
 
@@ -69,21 +71,31 @@ def main():
                      help="add a third condition -- noisy localization WITH "
                           "--icp-degeneracy-filter -- to confirm the fix doesn't regress "
                           "the default island world's already-good result.")
+    ap.add_argument("--with-confidence-margin", type=float, default=0.0,
+                     help="add a fourth condition -- noisy localization WITH "
+                          "--icp-degeneracy-filter AND --icp-confidence-margin set to this "
+                          "value -- to confirm the count-based confidence check ALSO doesn't "
+                          "regress the default world (n_valid there is ~170-180, far above "
+                          "any realistic margin, so this should be a true no-op).")
     args = ap.parse_args()
 
-    conditions = [(False, False, "GROUND-TRUTH POSE (original)"),
-                  (True, False, "NOISY LOCALIZATION (Stage 13 belief pose)")]
+    conditions = [(False, False, 0.0, "GROUND-TRUTH POSE (original)"),
+                  (True, False, 0.0, "NOISY LOCALIZATION (Stage 13 belief pose)")]
     if args.with_degeneracy_filter:
-        conditions.append((True, True, "NOISY LOCALIZATION + --icp-degeneracy-filter"))
+        conditions.append((True, True, 0.0, "NOISY LOCALIZATION + --icp-degeneracy-filter"))
+    if args.with_confidence_margin > 0:
+        conditions.append((True, True, args.with_confidence_margin,
+                            f"NOISY LOCALIZATION + filter + confidence-margin={args.with_confidence_margin:.0f}"))
 
-    for noisy_localization, degeneracy_filter, label in conditions:
+    for noisy_localization, degeneracy_filter, confidence_margin, label in conditions:
         print(f"=== {label} ===")
         for name, sx, sy, gx, gy in PAIRS:
             results = []
             for i in range(args.seeds):
                 seed = args.base_seed + i
                 status, t, final_dist, drift = run_one(
-                    sx, sy, gx, gy, seed, args.seconds, noisy_localization, degeneracy_filter)
+                    sx, sy, gx, gy, seed, args.seconds, noisy_localization, degeneracy_filter,
+                    confidence_margin)
                 results.append((seed, status, t, final_dist, drift))
             summary = ", ".join(
                 f"seed={s}:{st}" + (f"@{t:.1f}s" if t is not None else f"(d={d:.2f}m)")

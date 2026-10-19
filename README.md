@@ -1675,6 +1675,12 @@ trials with the filter on vs. off (e.g. 1.627m -> 0.325m, 1.733m -> 0.835m, 0.93
 and 5 of 6 trials now beat the raw-odometry baseline (vs. 0/6 before) -- the filter directly
 fixes the exact failure mode it targets.
 
+<p align="center">
+  <img src="media/navigate_wam_corridor_nofilter_map.gif" width="420" alt="Corridor world, --noisy-localization WITHOUT the degeneracy filter: the SLAM belief trail (purple) drifts steadily off the true path (green) along the corridor's own length as ICP confidently 'corrects' to a wrong along-wall position -- final drift 1.530m, worse than raw odometry's 0.318m">
+  <img src="media/navigate_wam_corridor_filtered_map.gif" width="420" alt="Same corridor, same seed, WITH --icp-degeneracy-filter: the belief trail tracks the true path much more closely throughout -- final drift 0.341m, now better than raw odometry's 0.450m">
+</p>
+<p align="center"><em>Same corridor world and seed, filter off (left) vs. on (right) -- the printed drift numbers are the real evidence (the difference is subtle at this full-corridor zoom level), but both show the same accumulating map and lidar hits for context.</em></p>
+
 **Sparse-world result -- a genuine, honest partial**: mixed. The E-W "blind crossing" improved
 in most trials (one seed that previously fell now reaches the goal; drift dropped in the
 others too), but the N-S crossing -- already falling 3/3 seeds even under ground truth, a
@@ -1845,6 +1851,8 @@ wam/
 ├── media/navigate_wam_pixel_step20_map.gif                                                                         # Stage 12 step 20's camera-derived occupancy map + A* path, same run
 ├── media/navigate_wam_localization_robot.gif                                                                         # Stage 13's noisy-localization navigation demo (detour B, seed 101)
 ├── media/navigate_wam_localization_map.gif                                                                             # Stage 13's true/odometry/belief trails, same run
+├── media/navigate_wam_corridor_nofilter_map.gif                                                                       # addendum: corridor world, --icp-degeneracy-filter OFF (belief drifts off-path)
+├── media/navigate_wam_corridor_filtered_map.gif                                                                       # addendum: same corridor/seed, filter ON (belief tracks true path)
 ├── requirements.txt
 └── README.md
 ```

@@ -131,9 +131,14 @@ an existing one.
     not THE whole story -- closed here: steps 17-20 tried and resolved seeding, cost-head
     target, corner-biased data, global planning, and sensing density in turn, without ever
     moving the headline navigation outcome, a reasonable stopping point absent a genuinely new
-    hypothesis; see below).
+    hypothesis + reopened once more to test the ONE hypothesis left at closure (A*/CEM safety-
+    margin mismatch, or turn-rate control authority) -- both tested in isolation, BOTH
+    negative (0/5 reached either way, for either lever), narrowing the likely cause to camera-
+    derived map ACCURACY near corners rather than planner tuning; see below).
 13. **Replace ground-truth pose with a real, noisy/drifting SLAM belief pose** -- DONE (a
-    clean, decisive positive result -- see below).
+    clean, decisive positive result on the default feature-rich island world, but a follow-up
+    stress test CONFIRMED the flagged sparse/aliased scope boundary is a real limitation, not
+    just caution -- see below).
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1514,6 +1519,36 @@ Best checkpoints if this track is ever revisited: `pixel_world_model_wall_explor
 (dynamics, step 16) + `pixel_cost_head_explore_far.pt` (cost head, step 18, far-depth target),
 with `navigate_wam_pixel.py --n-beams 7` (step 20, the default) for the occupancy map.
 
+### Mini-plan reopened once more: the one flagged hypothesis, tested -- also negative
+
+The closure above named two candidate fixes for the close-quarters maneuvering gap without
+testing either ("tighter CEM safety margins... or the planner's own safety margins around A*
+waypoints" / "trajectory tracking/control authority"). Both were tested now, each in isolation
+against the exact step 20 default config (same checkpoints, same 5 seeds 0-4):
+
+- **`eval_pixel_margins.py`**: `--robot-radius` (A*'s own obstacle inflation, default 0.35)
+  was smaller than `--pixel-safety-margin` (the CEM's own clearance preference, default 0.6)
+  -- a real mismatch where A* could hand the CEM a waypoint threading tighter than the CEM's
+  own margin wants, forcing a late swerve. Matching them (`--robot-radius 0.6`) changed
+  nothing: 0/5 reached before, 0/5 reached after, final distances statistically indistinguishable
+  (7.12-8.18m vs. 6.97-7.30m).
+- **`eval_pixel_control_authority.py`**: capping how fast the commanded forward/yaw-rate
+  setpoint can change (`--max-accel 1.5 --max-yaw-accel 3.0` -> `0.8`/`1.2`, a 2.5x gentler cap)
+  to remove the "sharp commanded turn" step 20's trace blamed for the fall. Also changed
+  nothing: 0/5 reached before, 0/5 reached after, final distances again statistically
+  indistinguishable (7.12-8.18m vs. 6.80-8.13m).
+
+**Honest conclusion**: both specific levers the closure note proposed turned out not to be the
+answer -- the failure isn't explained by an A*/CEM margin mismatch, nor by the commanded
+turn-rate being too aggressive for the leg controller to track. This narrows, rather than
+resolves, what "close-quarters maneuvering" actually means here: it's more likely a map-
+ACCURACY problem specific to the camera-derived grid (not sparsity, already fixed in step 20,
+but noisy/misplaced occupied cells near a corner the lidar-based Stage 3b track never has to
+deal with) than a planner-tuning problem, since two independent planner-side knobs both came
+back negative. Re-closing the mini-plan here with that more specific finding -- re-opening it
+again without a new hypothesis about map accuracy specifically would be repeating this same
+negative result a third time.
+
 ### Stage 13: replace ground-truth pose with a real, noisy/drifting SLAM belief pose
 
 Every stage since Stage 3 has deliberately used `MPCResidualEnv`'s own ground-truth pose to
@@ -1561,13 +1596,59 @@ out on its own toy robot, with no measurable cost to navigation performance on t
 `media/navigate_wam_localization_robot.gif` and `media/navigate_wam_localization_map.gif`
 (the latter showing the true/odometry/belief trails diverging and the belief trail tracking
 back close to true) capture one of the larger-drift runs (detour B, seed 101: odometry alone
-drifted 0.219-0.290m, belief stayed within 0.036-0.037m). Worth noting as a scope boundary,
-not a weakness found: this island world's walls are seen from many angles over a long
-episode, giving ICP plenty to match against -- a sparser or more aliased environment (long
-featureless corridors, repetitive geometry) is a harder SLAM problem in general and wasn't
-specifically stress-tested here; `n_icp_converged`/`n_icp_attempts` (printed by `--verbose`
-and the final summary line) is the diagnostic to watch if this is ever tried somewhere
-sparser.
+drifted 0.219-0.290m, belief stayed within 0.036-0.037m). Flagged at the time as a scope
+boundary, not a known weakness: this island world's walls are seen from many angles over a
+long episode, giving ICP plenty to match against -- a sparser or more aliased environment
+wasn't specifically stress-tested. See the addendum immediately below: it was tested, and the
+boundary turned out to be real.
+
+### Stage 13 addendum: stress-testing on sparser/aliased worlds -- the flagged boundary is real
+
+`navigate_wam_obstacles.py` gained `--world-outer`/`--world-island` (pass-through to
+`World.loop_corridor()`'s own existing `outer`/`island` params, default values reproducing
+the original 12x8m island exactly) so a harder world can be built without touching slam_sim
+at all. `eval_localization_sparse.py` tests two deliberately degenerate geometries against
+the SAME ground-truth-vs-noisy-localization comparison `eval_localization.py` already uses:
+
+- **"sparse"** (`outer=(30,30)`, a 1x1 island tucked in a corner so it's barely relevant): two
+  20m crossings through the empty middle, where every wall is well beyond the lidar's 8m max
+  range for a long stretch -- every beam misses, `scan_to_local_points` returns nothing, and
+  ICP has literally nothing to correct against (same "map too sparse to match" fallback to
+  raw odometry prediction Stage 13 already had, just sustained far longer).
+- **"corridor"** (`outer=(24,8)`, `island=(4,2,20,6)`): the SAME loop-corridor shape stretched
+  lengthwise into two 20m-long, 2m-wide straight hallways -- the textbook ICP-degenerate case
+  slam_sim's own `world.py` docstring names as the reason a LOOP was built in the first place:
+  translating along a straight corridor's own axis leaves the local wall scan looking
+  identical, so the along-corridor component of a pose correction is underconstrained.
+
+**Sparse result**: navigation itself is already hard here under ground truth (the N-S
+crossing fell all 3/3 seeds even with perfect pose -- a general task-difficulty effect, not a
+localization one). Where it DID matter: ICP convergence dropped sharply (22-36% of scans,
+vs. 96-100% on the default island world) during the long blind stretch, and when a wall was
+finally reacquired with only a few correspondences to work with, one trial's belief drift
+spiked to 1.2m in a single correction (seed 102, E-W crossing) -- an order of magnitude worse
+than anything seen on the default world, right as the robot also fell.
+
+**Corridor result, the more decisive one**: navigation succeeded in all 12/12 trials either
+way (the straight-hallway task itself is easy), but belief drift was WORSE than the
+uncorrected raw odometry baseline in 5 of 6 trials, confirmed drift pairs (belief vs. odom):
+1.605m vs. 0.825m, 0.519m vs. 0.403m, 1.607m vs. 0.388m, 2.130m vs. 0.180m, 0.941m vs.
+0.136m (only one of six was roughly a wash: 0.454m vs. 0.509m) -- despite ICP reporting
+96-100% convergence throughout, same as the default world's genuinely-good result. This is
+exactly the aliasing failure mode predicted, not a convergence-rate problem: ICP confidently
+"converges" to a wrong along-corridor shift because the local scan geometry can't distinguish
+it from the right one, actively making the pose estimate worse than doing nothing.
+
+**Honest conclusion**: Stage 13's original result stands for feature-rich worlds (confirmed
+again here: the default island's own numbers weren't touched), but the flagged scope boundary
+was not just caution -- it's a confirmed, real limitation. Plain ICP scan-matching, reused
+unmodified from slam_sim, is not a drop-in solution for sparse or aliased geometries; it can
+silently make localization worse than no correction at all while still reporting high
+"convergence". If this is picked up again, the right next step is a convergence-CONFIDENCE
+check (e.g. requiring `n_correspondences` well above `--icp-min-correspondences`, or rejecting
+corrections whose residual geometry is degenerate along one axis) before trusting an ICP
+result, not a different scan-matcher -- this wasn't built here since testing the boundary, not
+fixing it, was the ask.
 
 ## Repository layout
 
@@ -1604,7 +1685,8 @@ wam/
 ├── navigate_wam_obstacles.py       # Stage 3/3b/5: obstacle-aware planning in slam_sim's island world
 │                                     # (Stage 13: + --noisy-localization, a ported slam_sim Stage 4
 │                                     #  predict/correct/update SLAM loop -- belief_pose replaces
-│                                     #  ground truth for the grid/planner/A*)
+│                                     #  ground truth for the grid/planner/A*; + --world-outer/
+│                                     #  --world-island to build sparser/aliased test worlds)
 ├── eval_obstacles.py                 # Stage 3b: multi-seed A*-enabled vs. disabled comparison
 ├── eval_terrain.py                     # Stage 4: multi-seed flat-vs-terrain model comparison
 ├── eval_obstacles_terrain.py             # Stage 5: multi-seed obstacles+terrain comparison
@@ -1632,7 +1714,10 @@ wam/
 │                                                                       #  properly threaded, verbose pixel_cost diagnostic;
 │                                                                       #  step 19: + camera-derived occupancy map, A*, --record-map;
 │                                                                       #  step 20: + --n-beams, multi-beam per-replan sensing)
+├── eval_pixel_margins.py                                            # mini-plan reopened: A*/CEM safety-margin match test, negative
+├── eval_pixel_control_authority.py                                  # mini-plan reopened: turn-rate cap test, negative
 ├── eval_localization.py                                             # Stage 13: multi-seed ground-truth vs. noisy-localization comparison
+├── eval_localization_sparse.py                                      # Stage 13 addendum: sparse/aliased-world stress test, confirms the limitation
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth

@@ -2187,6 +2187,15 @@ degeneracy filter -- not a clean localization-driven signal, the same "refuted h
 test" conclusion Stage 16's own pre-addendum test reached. Task outcome was perfect in every
 condition: 24/24 reached, 0 falls, 0 timeouts.
 
+**Demo GIFs, same seed/phase pair, ground truth vs. noisy localization.**
+
+<p align="center">
+  <img src="media/navigate_wam_multi_slam_groundtruth_robot.gif" width="420" alt="Default world, ground-truth pose, seed 300 phase 0.00: two orange markers track the two real obstacles exactly, no ghosts -- the robot reaches the goal cleanly in 11.4s">
+  <img src="media/navigate_wam_multi_slam_ghost_robot.gif" width="420" alt="Same world, same seed/phase, noisy localization: a third orange marker appears alongside the two tracking the real obstacles -- the same static-reference-sparsity ghost-track artifact Stage 16 documented, now visible with two real obstacles live -- still reaches the goal in 15.6s">
+</p>
+
+<p align="center"><em>Ground truth (left): max_tracks_seen=2, no ghost. Noisy localization (right): max_tracks_seen=3, one ghost marker -- this is the exact seed=300/phase=0.00 row from the eval table above, task outcome unaffected by the ghost in this trial.</em></p>
+
 **One real difference worth noting, not overclaiming it.** The ground-truth ghost rate here
 (2/8 = 25%) is roughly double Stage 16's single-obstacle baseline (1/8 = 12.5%). Both are
 instances of Stage 10's own already-documented static-reference-sparsity artifact (not a
@@ -2392,6 +2401,10 @@ wam/
 │                                                                                                                       # oscillating near the obstacle for 45s, never reaching the goal (0/6 timeout)
 ├── media/navigate_wam_moving_slam_corridor_ghost_robot.gif                                                            # Stage 16 addendum: same corridor/seed, noisy localization -- up to 4 ghost
 │                                                                                                                       # dynamic-track markers (orange) appear simultaneously beside the real one
+├── media/navigate_wam_multi_slam_groundtruth_robot.gif                                                                # Stage 17: default world, ground truth pose, seed 300 phase 0.00 -- two
+│                                                                                                                       # orange markers track the two real obstacles exactly, no ghosts, reaches in 11.4s
+├── media/navigate_wam_multi_slam_ghost_robot.gif                                                                      # Stage 17: same world/seed/phase, noisy localization -- a third orange
+│                                                                                                                       # ghost marker appears alongside the two real tracks, still reaches in 15.6s
 ├── requirements.txt
 └── README.md
 ```

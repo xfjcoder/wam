@@ -2250,6 +2250,30 @@ pre-existing lidar-occlusion artifact (worse with two obstacles, worse still in 
 providing an elevated floor, and Stage 16's belief-drift-induced misclassification adding further
 ghosts on top of it under noisy localization specifically.
 
+**Adding `--icp-degeneracy-filter`: the opposite of Stage 16's single-obstacle result.**
+`eval_multi_obstacle_slam_sparse.py --filter-only` ran the same seeds/phases with the filter on.
+On sparse it's a wash, same confounded story: still 0/4 reached, ghost rate if anything ticked
+down slightly (3/4 &rarr; 2/4) but worst-case `max_tracks` ticked up (3 &rarr; 4) -- no clean
+effect either way. On **corridor**, though, the filter made things measurably *worse*, not
+better: reach rate dropped from 4/4 (noisy localization, no filter) to 2/4 -- back down to
+ground truth's own rate, but via a different failure mix (1 timeout + 1 fall, vs. ground truth's
+2 timeouts) -- and ghost rate stayed at 4/4 with worst-case `max_tracks` climbing to 6, higher
+than either ground truth (3) or noisy localization without the filter (5). This is despite belief
+drift actually being measurably *lower* with the filter (~0.49m mean across the 4 corridor trials)
+than without it (~1.1m mean) -- the filter is doing its documented job of reducing drift, yet the
+outcome and ghost-count got worse anyway, the reverse of Stage 16's single-obstacle corridor
+result (where the filter clearly helped on both counts).
+
+Two things temper how much weight this counter-intuitive result can bear. First, because the
+belief pose feeds back into the planner's own actions, a filter-on and filter-off run at the
+"same" seed/phase are not a clean single-variable swap -- they can diverge into physically
+different trajectories (different replanning decisions at each step), so the comparison is
+noisier than it looks. Second, this is only 4 corridor trials with the filter against 4 without
+it -- half this project's usual sample size, same caveat as the rest of this addendum. The result
+is reported as a genuine, surprising data point -- not swept under the rug just because it
+contradicts the single-obstacle precedent -- but not asserted as a confirmed "filter hurts with
+two obstacles" conclusion either; more trials would be needed to tell a real effect from noise.
+
 ## Repository layout
 
 ```
@@ -2356,7 +2380,10 @@ wam/
 ├── eval_multi_obstacle_slam_sparse.py                               # Stage 17 addendum: sparse/corridor escalation -- sparse confounded
 │                                                                       # (ground truth itself fails, 0/4), corridor reproduces the reach-rate
 │                                                                       # reversal (2/4 ground truth vs. 4/4 noisy) and shows two ghost
-│                                                                       # mechanisms stacking (pre-existing sparsity artifact + belief drift)
+│                                                                       # mechanisms stacking (pre-existing sparsity artifact + belief drift);
+│                                                                       # --icp-degeneracy-filter surprisingly makes corridor WORSE (2/4 reached,
+│                                                                       # max_tracks up to 6) despite measurably lower belief drift -- opposite
+│                                                                       # of Stage 16's single-obstacle result, flagged as suggestive not confirmed
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth

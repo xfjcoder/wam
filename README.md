@@ -2204,12 +2204,51 @@ two real obstacles create more lidar occlusion/clutter, mildly aggravating that 
 pre-existing artifact -- but 8 trials per condition is too few to treat a 1-in-8 vs. 2-in-8 gap
 as more than suggestive; it is not asserted as confirmed.
 
-**Natural next step, flagged rather than done here**: `--world-outer`/`--world-island` were added
-to this script (same Stage 13.1 plumbing every other combination now has) specifically so this
-pairing could be escalated onto Stage 13's sparse/corridor worlds the way Stage 16 was -- that
-escalation is what actually found the real, scope-gated effect there. It wasn't run as part of
-this stage; whether two obstacles' combined lidar occlusion interacts with along-corridor ICP
-degeneracy in some new way is an open, not-yet-tested question.
+### Stage 17 addendum: escalating to Stage 13's sparse/corridor worlds
+
+The natural next step flagged above: `eval_multi_obstacle_slam_sparse.py` (new) mirrors
+`eval_moving_obstacle_slam_sparse.py`'s own sparse/corridor pair table, now with both obstacles
+placed at roughly 1/3 and 2/3 of the way along each pair's travel path (instead of Stage 10
+default world's "same x, two different y" layout, which only made sense for that world's own
+N-S left-corridor scenario), each still oscillating perpendicular to the direction of travel.
+Run at `--phases 2` (4 trials per condition per scenario, half Stage 16's own addendum sample)
+-- a single corridor trial already took ~2 minutes wall-clock for a 30s sim episode, and two
+obstacles plus the sparse world's much larger occupancy grid pushed the full sweep close to an
+hour; this sample is explicitly thinner than this project's usual 6-8 trial convention and the
+results below should be read with that in mind.
+
+**Sparse: confounded again, same as the single-obstacle case.** Ground truth itself failed the
+task independent of localization -- 0/4 reached, all 4 trials fell, 0 ghost tracks -- so, exactly
+as Stage 16's addendum found for one obstacle, task-outcome comparisons on this world aren't
+clean; two real obstacles don't change that this scenario's base difficulty dominates. The one
+real signal: ghost-track rate still jumped from 0/4 under ground truth to 3/4 under noisy
+localization (one trial's belief drift reached a catastrophic 8.314m, essentially total
+localization failure), matching the single-obstacle finding that ghosting on this world
+correlates noisily with large drift even though it can't be read as "caused by" localization
+alone given the confound.
+
+**Corridor: reproduces the reach-rate reversal, and reveals two ghost mechanisms stacking.**
+Ground truth reached 2/4 (the other 2 timed out, both with a ghost track already present --
+`max_tracks=3`); noisy localization reached 4/4 (all with a ghost track, `max_tracks` up to 5).
+Same *direction* as the reach-rate reversal chased down earlier in this document (ground truth's
+exactly-reproducible obstacle estimate locking the planner into a periodic retreat), now showing
+up with two real obstacles too -- though less extreme than the original single-obstacle corridor
+result's clean 0/6 vs. 6/6, consistent with this being a thinner, noisier sample (n=2 per pair
+here vs. n=3 per pair there).
+
+The ghost-track picture is genuinely different from the single-obstacle corridor escalation,
+though, and worth stating precisely rather than folding into the same story: there, ground truth
+had ZERO ghosts (`max_tracks=1`) and noisy localization produced up to 4 -- a clean contrast. Here,
+ground truth ALREADY ghosts 3/4 of the time (`max_tracks=3`), because Stage 10's own
+static-reference-sparsity artifact (present under ground truth too, documented in the default-world
+result above) is apparently aggravated further by this narrower, longer corridor. Noisy
+localization then pushes `max_tracks` higher still, to 5 -- on top of that already-elevated
+baseline, not starting from zero. Read together with belief drift of 0.52-2.33m (well past the
+0.25m `match_radius`, consistent with Stage 13's documented along-corridor ICP degeneracy), the
+most honest read is that two distinct ghost mechanisms are both active and stacking here: the
+pre-existing lidar-occlusion artifact (worse with two obstacles, worse still in a narrow corridor)
+providing an elevated floor, and Stage 16's belief-drift-induced misclassification adding further
+ghosts on top of it under noisy localization specifically.
 
 ## Repository layout
 
@@ -2314,6 +2353,10 @@ wam/
 ├── eval_multi_obstacle_slam.py                                      # Stage 17: same 3-condition comparison -- ghost rate not clearly
 │                                                                       # localization-driven on the default world (2/8 ground truth, 3/8 noisy,
 │                                                                       # 2/8 with filter); 24/24 reached in every condition, 0 falls, 0 timeouts
+├── eval_multi_obstacle_slam_sparse.py                               # Stage 17 addendum: sparse/corridor escalation -- sparse confounded
+│                                                                       # (ground truth itself fails, 0/4), corridor reproduces the reach-rate
+│                                                                       # reversal (2/4 ground truth vs. 4/4 noisy) and shows two ghost
+│                                                                       # mechanisms stacking (pre-existing sparsity artifact + belief drift)
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth

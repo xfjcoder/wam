@@ -2274,6 +2274,12 @@ is reported as a genuine, surprising data point -- not swept under the rug just 
 contradicts the single-obstacle precedent -- but not asserted as a confirmed "filter hurts with
 two obstacles" conclusion either; more trials would be needed to tell a real effect from noise.
 
+<p align="center">
+  <img src="media/navigate_wam_multi_slam_corridor_filter_ghost_robot.gif" width="480" alt="Corridor-bottom pair, seed=101, noisy localization WITH --icp-degeneracy-filter: orange markers show up to 6 simultaneous dynamic-track estimates (2 real obstacles plus 4 ghosts) near the trial's end -- the robot ends up 0.63m short of the goal when the 50s episode times out">
+</p>
+
+<p align="center"><em>This is the exact corridor-bottom/seed=101/filter-on row from the table above: max_tracks_seen=6, the highest ghost count across every condition tested in this addendum, despite the filter's own belief drift (0.613m) being lower than several no-filter corridor trials.</em></p>
+
 ## Repository layout
 
 ```
@@ -2475,6 +2481,8 @@ wam/
 │                                                                                                                       # orange markers track the two real obstacles exactly, no ghosts, reaches in 11.4s
 ├── media/navigate_wam_multi_slam_ghost_robot.gif                                                                      # Stage 17: same world/seed/phase, noisy localization -- a third orange
 │                                                                                                                       # ghost marker appears alongside the two real tracks, still reaches in 15.6s
+├── media/navigate_wam_multi_slam_corridor_filter_ghost_robot.gif                                                      # Stage 17 addendum: corridor-bottom, seed 101, noisy localization +
+│                                                                                                                       # --icp-degeneracy-filter -- up to 6 simultaneous tracks near the end, times out 0.63m short
 ├── requirements.txt
 └── README.md
 ```

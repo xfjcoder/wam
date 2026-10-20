@@ -206,6 +206,25 @@ an existing one.
     (2 reached, 1 fell), not a clean reproduction of the real 6/6 -- see below.
     `--icp-degeneracy-filter` doesn't close this gap and remains the inconsistent fix Stage 13
     already found it to be; see below.
+17. **Two independently-moving obstacles (Stage 10) combined with noisy SLAM localization**
+    -- DONE (the SAME refutation as Stage 16's main result, now reconfirmed with two real
+    obstacles instead of one). `navigate_wam_multi_obstacle_slam.py` (new) combines Stage 10's
+    two-obstacle tracker with Stage 13's noisy/drifting belief pose, the same way Stage 16
+    combined the single-obstacle tracker with it. On the default 12x8m island world, belief
+    drift stayed tiny in every condition (0.018-0.061m, still well under the tracker's 0.25m
+    `match_radius`) -- so, as Stage 16's addendum already established, this world structurally
+    can't produce the drift magnitude the ghosting hypothesis needs. Ghost-track rate was
+    2/8 under ground truth, 3/8 under noisy localization, 2/8 with
+    `--icp-degeneracy-filter` -- not a clear localization-driven effect, the same conclusion
+    Stage 16's own main (pre-addendum) test reached. Task outcome was perfect across all three
+    conditions (24/24 reached, 0 falls, 0 timeouts). One real difference from the
+    single-obstacle baseline: the ground-truth ghost rate itself is roughly double Stage 16's
+    (2/8 = 25% here vs. 1/8 = 12.5% there) -- plausibly two real obstacles' extra lidar
+    occlusion/clutter mildly aggravating Stage 10's own already-documented
+    static-reference-sparsity artifact, though 8 trials is too few to treat that gap as more
+    than suggestive. Not yet escalated to Stage 13's sparse/corridor worlds the way Stage 16
+    was -- `--world-outer`/`--world-island` were added for that future option, but running it
+    is a flagged next step, not done here.
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -2148,6 +2167,41 @@ smears that estimate enough to break the lock -- confirmed by isolating the chan
 an honest caveat that the isolated test reproduced the mechanism, not the real condition's exact,
 uniformly-safe outcome.
 
+### Stage 17: two independently-moving obstacles combined with noisy SLAM localization
+
+The one untested pairing left among this project's established tracks: Stage 10's two-obstacle
+tracker (clustering + per-track data association, verified only under ground truth) had never run
+with Stage 13's noisy/drifting belief pose. `navigate_wam_multi_obstacle_slam.py` (new) builds
+this the same way Stage 16 built the single-obstacle version -- porting the odometry-noise +
+ICP-correction block onto `navigate_wam_multi_obstacle.py`'s two-obstacle structure unmodified.
+`eval_multi_obstacle_slam.py` (new) mirrors `eval_moving_obstacle_slam.py`'s 3-condition protocol
+(ground truth, noisy localization, noisy + `--icp-degeneracy-filter`), with the ghost-track
+diagnostic threshold shifted from >1 to >2 (there are two real obstacles here).
+
+**Same refutation as Stage 16's main result, now with two real obstacles.** On the default 12x8m
+island world, belief drift stayed tiny across all three conditions (0.018-0.061m, 8 seeds each)
+-- still well under the tracker's 0.25m `match_radius`, exactly as Stage 16's addendum already
+established this world structurally cannot produce the drift magnitude the ghosting hypothesis
+needs. Ghost-track rate was 2/8 under ground truth, 3/8 under noisy localization, 2/8 with the
+degeneracy filter -- not a clean localization-driven signal, the same "refuted here, not a clean
+test" conclusion Stage 16's own pre-addendum test reached. Task outcome was perfect in every
+condition: 24/24 reached, 0 falls, 0 timeouts.
+
+**One real difference worth noting, not overclaiming it.** The ground-truth ghost rate here
+(2/8 = 25%) is roughly double Stage 16's single-obstacle baseline (1/8 = 12.5%). Both are
+instances of Stage 10's own already-documented static-reference-sparsity artifact (not a
+localization effect, since it shows up under ground truth too), so the plausible read is that
+two real obstacles create more lidar occlusion/clutter, mildly aggravating that same
+pre-existing artifact -- but 8 trials per condition is too few to treat a 1-in-8 vs. 2-in-8 gap
+as more than suggestive; it is not asserted as confirmed.
+
+**Natural next step, flagged rather than done here**: `--world-outer`/`--world-island` were added
+to this script (same Stage 13.1 plumbing every other combination now has) specifically so this
+pairing could be escalated onto Stage 13's sparse/corridor worlds the way Stage 16 was -- that
+escalation is what actually found the real, scope-gated effect there. It wasn't run as part of
+this stage; whether two obstacles' combined lidar occlusion interacts with along-corridor ICP
+degeneracy in some new way is an open, not-yet-tested question.
+
 ## Repository layout
 
 ```
@@ -2245,6 +2299,12 @@ wam/
 │                                                                       # the hypothesis IS real there (corridor: 6/6 noisy trials ghost, drift
 │                                                                       # 0.4-2.2m along the corridor's own axis, exceeding match_radius); ground
 │                                                                       # truth's own 0/6 reach rate traces to Stage 10/11's indecisive-lingering bug
+├── navigate_wam_multi_obstacle_slam.py                              # Stage 17: SLAM localization + Stage 10's TWO-obstacle tracker, combined
+│                                                                       # for the first time -- same odometry-noise/ICP block ported onto the
+│                                                                       # two-obstacle structure; ghost-track threshold shifts from >1 to >2
+├── eval_multi_obstacle_slam.py                                      # Stage 17: same 3-condition comparison -- ghost rate not clearly
+│                                                                       # localization-driven on the default world (2/8 ground truth, 3/8 noisy,
+│                                                                       # 2/8 with filter); 24/24 reached in every condition, 0 falls, 0 timeouts
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth

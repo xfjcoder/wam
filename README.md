@@ -9,6 +9,46 @@ A separate project (and repo) from `go1_rl_walk` and `slam_sim` (sibling directo
 following the same convention: each new kind of problem gets its own repo, not a branch of
 an existing one.
 
+## Project summary -- closed
+
+<p align="center">
+  <img src="media/navigate_wam_demo.gif" width="280" alt="Stage 2: the learned world model driving the robot along an A*-planned path to a goal, no real physics simulator involved">
+  <img src="media/navigate_wam_localization_robot.gif" width="280" alt="Stage 13: navigation under noisy, lidar+ICP-corrected SLAM belief pose instead of ground truth">
+  <img src="media/navigate_wam_multi_slam_ghost_robot.gif" width="280" alt="Stage 17: two independently-moving obstacles tracked under noisy SLAM localization -- orange markers show the tracker's own real and ghost estimates">
+</p>
+
+*Left to right: Stage 2's original learned-model planner/controller loop; Stage 13's noisy-SLAM
+navigation; Stage 17's two-obstacle tracker combined with noisy localization, the project's most
+feature-complete combination.*
+
+Seventeen stages plus several addenda, closed here. In brief, what got built and what it found:
+
+- **A learned forward-dynamics model stands in for the real physics simulator** (Stages 1-2),
+  driving real A*/CEM planning and MPC-style control on top -- not just open-loop rollout
+  prediction.
+- **Static obstacle avoidance, then moving obstacles with velocity extrapolation, then two
+  independent moving obstacles** (Stages 3, 8-10) -- each a genuine capability addition, not a
+  reparameterization of the last.
+- **A real 2D lidar SLAM pipeline (occupancy-grid mapping + ICP pose correction), ported in from
+  the sibling `slam_sim` project** (Stage 13), replacing ground-truth pose with the same
+  noisy-odometry+ICP-belief loop that project built from scratch -- including its own documented
+  along-corridor ICP degeneracy and the `--icp-degeneracy-filter` fix, which helps on some
+  worlds/seeds and not others rather than being a uniform win.
+- **Several honestly-negative results, kept rather than hidden**: Stage 7's dead-reckoning-error
+  fixes, Stage 11's indecisive-lingering-mechanism fixes, and Stage 12's joint-training idea all
+  measured real attempts that didn't pay off, closed with the numbers that show why.
+- **The project's most-investigated finding**: a ground-truth-vs-noisy-localization reach-rate
+  *reversal* (ground truth doing WORSE than noisy localization on the corridor world) -- first
+  found in Stage 16's escalation, initially left unexplained, then traced to a genuine mechanism
+  (ground truth's exactly-reproducible obstacle estimate locks the CEM planner into a periodic
+  retreat the way injected noise does not) and reconfirmed, with a twist, in Stage 17's two-obstacle
+  version -- where `--icp-degeneracy-filter` was found to make the corridor case measurably
+  *worse*, the opposite of its effect in the single-obstacle case, reported as a genuine surprise
+  rather than smoothed over.
+
+No further stages are planned on this repo unless reopened; see `wam-staged-plan` memory for the
+full per-stage history and every commit hash.
+
 ## Scoping decisions
 
 - **Data source: reuse the real Go2 quadruped, not a toy environment.** `go1_rl_walk/mpc`'s

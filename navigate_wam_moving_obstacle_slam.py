@@ -139,6 +139,17 @@ def main():
     parser.add_argument("--record-map", type=str, default=None)
     parser.add_argument("--map-render-every", type=int, default=2)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--world-outer", type=float, nargs=2, default=(12.0, 8.0),
+                         metavar=("W", "H"),
+                         help="(width, height) of the outer rectangle passed to "
+                              "World.loop_corridor() -- default reproduces the original "
+                              "12x8m island world exactly. Used to escalate this combination "
+                              "onto Stage 13's sparse/corridor stress worlds.")
+    parser.add_argument("--world-island", type=float, nargs=4, default=(4.0, 2.0, 8.0, 6.0),
+                         metavar=("X1", "Y1", "X2", "Y2"),
+                         help="(x1, y1, x2, y2) of the island rectangle passed to "
+                              "World.loop_corridor() -- default reproduces the original "
+                              "4x4m island exactly.")
     args = parser.parse_args()
 
     # Same bug class Stage 12 step 18 / Stage 13's seeding-bug-fix commit both found
@@ -151,7 +162,7 @@ def main():
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    world = World.loop_corridor()
+    world = World.loop_corridor(outer=tuple(args.world_outer), island=tuple(args.world_island))
     center_x = (args.obstacle_center_x if args.obstacle_center_x is not None
                 else (args.start_x + args.goal_x) / 2.0)
     center_y = (args.obstacle_center_y if args.obstacle_center_y is not None

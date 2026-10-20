@@ -189,7 +189,18 @@ an existing one.
     instance) and fixed the same unseeded-CEM-sampling bug Stage 12/13 found independently in
     `navigate_wam_pixel.py`/`navigate_wam_obstacles.py`, this time in
     `navigate_wam_moving_obstacle.py`/`navigate_wam_multi_obstacle.py` -- re-verified Stage 8's
-    own headline conclusion still holds with proper seeding; see below.
+    own headline conclusion still holds with proper seeding; see below. **Addendum: escalated to
+    Stage 13's sparse/corridor worlds and the hypothesis flips** -- it's not refuted in general,
+    it's scope-gated to drift magnitudes the default island world never produces. On the corridor
+    world, belief drift reaches 0.4-2.2m (vs. 0.02-0.045m on the default world), confirmed via
+    `--verbose` trace to concentrate almost entirely along the corridor's own long axis -- exactly
+    Stage 13's documented along-corridor ICP degeneracy -- and that drift DOES misclassify static
+    wall cells as ghosts, in 6/6 noisy trials (vs. 0/6 under ground truth). A separate, honestly
+    unexplained side effect: ground truth itself got 0/6 reached (all timeout, traced to a
+    recurrence of Stage 10/11's own already-documented "indecisive lingering" oscillation, severe
+    enough in this narrow corridor to stall completely) while noisy localization reached 6/6 --
+    `--icp-degeneracy-filter` doesn't close this gap and remains the inconsistent fix Stage 13
+    already found it to be; see below.
 
 ### Stage 1: data collection, training, and open-loop verification
 
@@ -1999,6 +2010,84 @@ vantage sampling, or a confidence check on a track's own sighting count before t
 real, mirroring Stage 13's own confidence-check lineage for ICP correspondences). Don't re-open
 Stage 10 over this without new evidence it matters for an actual outcome.
 
+### Stage 16 addendum: escalating to Stage 13's sparse/corridor worlds -- the hypothesis is real after all, just scope-gated
+
+Stage 16's main result refuted the belief-drift-ghosting hypothesis, but only on the default
+island world, where Stage 13 already established belief drift never exceeds ~0.045m -- well
+inside the tracker's 0.25m `match_radius`. That's a weak test of a hypothesis about what happens
+when drift gets LARGE. Stage 13's own sparse/corridor worlds are specifically built to produce
+much larger drift (long blind stretches with no lidar hits at all; long straight corridors where
+ICP's correction is underconstrained along the corridor's own axis) -- exactly the conditions
+this hypothesis needs to have a fair shot. `navigate_wam_moving_obstacle_slam.py` gained
+`--world-outer`/`--world-island` (the same Stage 13.1 addition `navigate_wam_obstacles.py` already
+has) so it can run on these worlds too; `eval_moving_obstacle_slam_sparse.py` (new) mirrors
+`eval_localization_sparse.py`'s scenario/pair table plus `eval_moving_obstacle_slam.py`'s
+ghost-track diagnostics, run at 3 phases x 3 seeds per pair (fewer than the default world's 8 --
+these worlds are 5-8x slower per sim-second to step given their much larger occupancy grids, so a
+full 8-phase sweep wasn't a reasonable time budget).
+
+**A scenario-design bug found and fixed before the real test**: the obstacle's default axis is
+"x", which for east-west-travel pairs put it oscillating LENGTHWISE along the robot's own path --
+blocking, not crossing, unlike Stage 8/9's original scenario (travel along y, obstacle crossing
+along x). Caught via an early timing probe that failed to reach the goal in 60s for a reason that
+turned out to be pure scenario difficulty, not localization. Fixed by setting each pair's
+`--obstacle-axis` to whichever axis is perpendicular to its own direction of travel.
+
+**Sparse world: messy, confounded, inconclusive.** Ground truth itself fails here independent of
+localization -- the "blind crossing N-S" pair got 0/3 reached under ground truth (all fell), and
+"blind crossing E-W" got 2/3 -- so task-outcome comparisons aren't clean. Ghost tracks did appear
+under noisy localization, roughly tracking a drift-magnitude threshold but noisily: one E-W trial
+with catastrophic 16.2m drift (essentially total localization failure, not graceful degradation)
+showed a ghost while two others with moderate 0.4-1.3m drift didn't, while all 3 N-S trials
+(drift 2.6-5.9m) did. `--icp-degeneracy-filter` reduced drift substantially in some N-S trials
+(5.9m -> 2.8m, 3.5m -> 0.1m, 2.6m -> 0.4m) and cut the ghost rate from 3/3 to 1/3, but changed
+NOTHING about the outcome (still 0/3 reached, all fell, with or without the filter) -- confirming
+those falls are a pre-existing control/task-difficulty issue, not a localization one. Sparse
+results are reported honestly as inconclusive, not swept under the rug.
+
+**Corridor world: clean, striking, and directly confirms the hypothesis.** Across both corridor
+pairs (6 trials total), ground truth got 0/6 reached -- every single trial timed out. Traced via
+`--verbose`: the robot makes good progress to roughly the corridor's midpoint (right at the
+obstacle's fixed x-position, since it only oscillates sideways in this narrow 2m hallway) by
+~t=14s, then gets stuck oscillating back and forth for the remaining 30+ seconds without net
+progress -- a recurrence of Stage 10/11's own already-documented "indecisive lingering" pattern,
+not a new bug, just severe enough in this narrower corridor to cause outright timeouts instead of
+mere delay. Under noisy localization, all 6 trials REACHED the goal -- but all 6 also showed ghost
+tracks (`max_tracks_seen` up to 5), with belief drift of 0.4-2.2m. A direct `--verbose` trace of
+one such trial confirms the mechanism precisely: at one sampled point, belief had drifted 1.23m
+along the corridor's own long axis while drifting only 0.05m across it -- exactly Stage 13's
+documented along-corridor ICP degeneracy -- and a static wall cell near the corridor's far end got
+written into the live map at that drift-shifted location, landing outside the tracker's 0.25m
+match_radius and getting classified as a new "ghost" dynamic track. **This is the Stage 16
+hypothesis, confirmed directly**: belief-drift-induced ghosting is real, it just needs drift
+larger than this tracker's match_radius to manifest, which the default island world's SLAM loop
+never produces but this corridor world reliably does.
+
+**One result is left honestly unexplained, not asserted past the evidence**: why the reach rate
+flips from 0/6 (ground truth) to 6/6 (noisy localization) on the corridor. The obvious guess --
+that reclassifying a wall cell as "dynamic" removes it from the hard static occupancy map
+(`tracker.static_subset()`) and effectively "erases" part of the corridor wall, making the route
+artificially easier for A*/CEM -- was checked directly against the verbose trace and is NOT
+supported: `n_obs` (the static point count fed to the planner) keeps climbing throughout the
+episode rather than dropping when ghosts appear. The real mechanism is still unknown; this is
+reported as an open question, not a confirmed finding. `--icp-degeneracy-filter` doesn't resolve
+it either -- with the filter, corridor reach rate is 5/6 (still far above ground truth's 0/6), and
+the filter's effect on drift itself is inconsistent here too: it cut one trial's drift from 0.44m
+to 0.03m (eliminating that trial's ghost) but made another trial's drift WORSE (0.64m -> 1.05m,
+turning a reach into a timeout) -- the same "helps some seeds, hurts others, no uniform win"
+behavior Stage 13's own addendum already established for this flag, now reconfirmed in the
+ghost-tracking context rather than newly discovered.
+
+**Honest overall conclusion**: escalating beyond the single island world was the right call --
+it overturns Stage 16's own main-result framing from "hypothesis refuted" to "hypothesis real,
+but scope-gated to genuinely SLAM-degenerate geometries that produce drift past the tracker's
+match_radius," which the default world structurally cannot do. It did NOT uncover fresh bugs in
+either of the two mechanisms it touched most (corridor's indecisive-lingering limitation, and
+`--icp-degeneracy-filter`'s inconsistency) -- both are reconfirmations of already-documented
+Stage 10/11 and Stage 13 findings, now shown to recur in this new combination too. The one
+genuinely new, unexplained result (the reach-rate reversal) is flagged as open rather than
+force-fit to a theory that didn't survive direct checking.
+
 ## Repository layout
 
 ```
@@ -2092,6 +2181,10 @@ wam/
 ├── eval_moving_obstacle_slam.py                                     # Stage 16: multi-phase 3-condition comparison -- ghost-track rate is
 │                                                                       # statistically the SAME under ground truth and noisy localization
 │                                                                       # (hypothesis refuted); the ghost itself is Stage 10's own residual bug
+├── eval_moving_obstacle_slam_sparse.py                              # Stage 16 addendum: same comparison on Stage 13's sparse/corridor worlds --
+│                                                                       # the hypothesis IS real there (corridor: 6/6 noisy trials ghost, drift
+│                                                                       # 0.4-2.2m along the corridor's own axis, exceeding match_radius); ground
+│                                                                       # truth's own 0/6 reach rate traces to Stage 10/11's indecisive-lingering bug
 ├── data/rollouts.npz          # collected train/val transitions (flat ground)
 ├── data/rollouts_terrain.npz    # Stage 4: collected train/val transitions (terrain)
 ├── data/rollouts_pixels.npz       # Stage 12: small flat-ground dataset with paired RGB+depth

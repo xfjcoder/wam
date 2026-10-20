@@ -242,13 +242,18 @@ def main():
         robot_cam = mj.MjvCamera()
         robot_cam.type = mj.mjtCamera.mjCAMERA_FREE
         robot_cam.lookat[:] = [world.bounds[1] / 2.0, world.bounds[3] / 2.0, 0.0]
-        robot_cam.distance = 17.0
+        # Scaled to the world's own footprint (1.45x the longer side reproduces the original
+        # 12x8 default world's hand-tuned distance=17.0 exactly) so sparse/corridor worlds --
+        # 2-2.5x larger than the default -- still fit in frame instead of clipping.
+        robot_cam.distance = 1.45 * max(world.bounds[1] - world.bounds[0],
+                                         world.bounds[3] - world.bounds[2])
         robot_cam.elevation = -60
         robot_cam.azimuth = 90
         robot_renderer = mj.Renderer(env.mujoco_go2.model, height=480, width=640)
         START_RGBA = (0.1, 0.9, 0.1, 1.0)
         GOAL_RGBA = (0.2, 0.3, 0.9, 1.0)
         WAYPOINT_RGBA = (0.9, 0.9, 0.1, 1.0)
+        DYNAMIC_RGBA = (1.0, 0.45, 0.0, 1.0)
 
     map_frames = []
     robot_frames = []
@@ -417,6 +422,8 @@ def main():
             if last_waypoints is not None:
                 for wp in last_waypoints[:-1]:
                     _add_marker(robot_renderer.scene, wp, WAYPOINT_RGBA, size=0.12)
+            for track_pos, _track_vel in last_dynamic_estimates:
+                _add_marker(robot_renderer.scene, track_pos, DYNAMIC_RGBA, size=0.2)
             robot_frames.append(robot_renderer.render().copy())
 
         if terminated or truncated:

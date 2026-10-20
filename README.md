@@ -2052,7 +2052,14 @@ obstacle's fixed x-position, since it only oscillates sideways in this narrow 2m
 ~t=14s, then gets stuck oscillating back and forth for the remaining 30+ seconds without net
 progress -- a recurrence of Stage 10/11's own already-documented "indecisive lingering" pattern,
 not a new bug, just severe enough in this narrower corridor to cause outright timeouts instead of
-mere delay. Under noisy localization, all 6 trials REACHED the goal -- but all 6 also showed ghost
+mere delay.
+
+<p align="center">
+  <img src="media/navigate_wam_moving_slam_corridor_groundtruth_robot.gif" width="480" alt="Corridor world, ground-truth pose: the robot makes early progress toward the obstacle's fixed position, then gets stuck oscillating back and forth in roughly the same spot for the rest of the 45s episode, never reaching the goal marker (blue, far right) -- Stage 10/11's indecisive-lingering pattern, severe enough in this narrow corridor to cause an outright timeout">
+</p>
+<p align="center"><em>Ground truth pose, corridor world, seed 100: 0/6 reached across both corridor pairs under this condition -- this trial times out after 45s stuck near the obstacle.</em></p>
+
+Under noisy localization, all 6 trials REACHED the goal -- but all 6 also showed ghost
 tracks (`max_tracks_seen` up to 5), with belief drift of 0.4-2.2m. A direct `--verbose` trace of
 one such trial confirms the mechanism precisely: at one sampled point, belief had drifted 1.23m
 along the corridor's own long axis while drifting only 0.05m across it -- exactly Stage 13's
@@ -2062,6 +2069,11 @@ match_radius and getting classified as a new "ghost" dynamic track. **This is th
 hypothesis, confirmed directly**: belief-drift-induced ghosting is real, it just needs drift
 larger than this tracker's match_radius to manifest, which the default island world's SLAM loop
 never produces but this corridor world reliably does.
+
+<p align="center">
+  <img src="media/navigate_wam_moving_slam_corridor_ghost_robot.gif" width="480" alt="Corridor world, noisy localization, same seed: orange markers show the tracker's own dynamic-obstacle estimates. One tracks the real moving obstacle, but by the trial's end up to 4 OTHER orange markers appear simultaneously, sitting still near the corridor walls -- these are the ghost tracks, directly visible for the first time rather than only inferred from max_tracks_seen">
+</p>
+<p align="center"><em>Same corridor world and seed, noisy localization: this trial reaches the goal in 33.2s, but max_tracks_seen hits 5 -- a frame near the end shows 4 simultaneous orange markers beyond the one following the real obstacle.</em></p>
 
 **One result is left honestly unexplained, not asserted past the evidence**: why the reach rate
 flips from 0/6 (ground truth) to 6/6 (noisy localization) on the corridor. The obvious guess --
@@ -2268,6 +2280,10 @@ wam/
 ├── media/navigate_wam_localization_map.gif                                                                             # Stage 13's true/odometry/belief trails, same run
 ├── media/navigate_wam_corridor_nofilter_map.gif                                                                       # addendum: corridor world, --icp-degeneracy-filter OFF (belief drifts off-path)
 ├── media/navigate_wam_corridor_filtered_map.gif                                                                       # addendum: same corridor/seed, filter ON (belief tracks true path)
+├── media/navigate_wam_moving_slam_corridor_groundtruth_robot.gif                                                      # Stage 16 addendum: corridor world, ground truth pose -- robot gets stuck
+│                                                                                                                       # oscillating near the obstacle for 45s, never reaching the goal (0/6 timeout)
+├── media/navigate_wam_moving_slam_corridor_ghost_robot.gif                                                            # Stage 16 addendum: same corridor/seed, noisy localization -- up to 4 ghost
+│                                                                                                                       # dynamic-track markers (orange) appear simultaneously beside the real one
 ├── requirements.txt
 └── README.md
 ```

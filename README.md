@@ -195,10 +195,15 @@ an existing one.
     world, belief drift reaches 0.4-2.2m (vs. 0.02-0.045m on the default world), confirmed via
     `--verbose` trace to concentrate almost entirely along the corridor's own long axis -- exactly
     Stage 13's documented along-corridor ICP degeneracy -- and that drift DOES misclassify static
-    wall cells as ghosts, in 6/6 noisy trials (vs. 0/6 under ground truth). A separate, honestly
-    unexplained side effect: ground truth itself got 0/6 reached (all timeout, traced to a
-    recurrence of Stage 10/11's own already-documented "indecisive lingering" oscillation, severe
-    enough in this narrow corridor to stall completely) while noisy localization reached 6/6 --
+    wall cells as ghosts, in 6/6 noisy trials (vs. 0/6 under ground truth). A separate side effect
+    -- ground truth itself got 0/6 reached (all timeout) while noisy localization reached 6/6 --
+    was chased down directly: it's the tracked obstacle's velocity-extrapolation being computed
+    with essentially zero noise every replan under ground truth, recreating an IDENTICAL "too
+    risky, retreat" verdict every time the robot and obstacle recur at the same relative phase --
+    a resonance-locked limit cycle synced to the obstacle's own oscillation period, confirmed by
+    isolating JUST that channel: injecting noise only into the tracked obstacle's position/velocity
+    estimate (not the robot's own pose) broke all 3 tested timeouts, though into mixed outcomes
+    (2 reached, 1 fell), not a clean reproduction of the real 6/6 -- see below.
     `--icp-degeneracy-filter` doesn't close this gap and remains the inconsistent fix Stage 13
     already found it to be; see below.
 
@@ -2075,20 +2080,59 @@ never produces but this corridor world reliably does.
 </p>
 <p align="center"><em>Same corridor world and seed, noisy localization: this trial reaches the goal in 33.2s, but max_tracks_seen hits 5 -- a frame near the end shows 4 simultaneous orange markers beyond the one following the real obstacle.</em></p>
 
-**One result is left honestly unexplained, not asserted past the evidence**: why the reach rate
-flips from 0/6 (ground truth) to 6/6 (noisy localization) on the corridor. The obvious guess --
-that reclassifying a wall cell as "dynamic" removes it from the hard static occupancy map
-(`tracker.static_subset()`) and effectively "erases" part of the corridor wall, making the route
-artificially easier for A*/CEM -- was checked directly against the verbose trace and is NOT
-supported: `n_obs` (the static point count fed to the planner) keeps climbing throughout the
-episode rather than dropping when ghosts appear. The real mechanism is still unknown; this is
-reported as an open question, not a confirmed finding. `--icp-degeneracy-filter` doesn't resolve
-it either -- with the filter, corridor reach rate is 5/6 (still far above ground truth's 0/6), and
-the filter's effect on drift itself is inconsistent here too: it cut one trial's drift from 0.44m
-to 0.03m (eliminating that trial's ghost) but made another trial's drift WORSE (0.64m -> 1.05m,
-turning a reach into a timeout) -- the same "helps some seeds, hurts others, no uniform win"
-behavior Stage 13's own addendum already established for this flag, now reconfirmed in the
-ghost-tracking context rather than newly discovered.
+**The reach-rate reversal, chased down.** Why does the reach rate flip from 0/6 (ground truth) to
+6/6 (noisy localization) on the corridor? The first guess -- that reclassifying a wall cell as
+"dynamic" removes it from the hard static occupancy map (`tracker.static_subset()`) and
+effectively "erases" part of the corridor wall, making the route artificially easier for A*/CEM --
+was checked directly against the verbose trace and is NOT supported: `n_obs` (the static point
+count fed to the planner) keeps climbing throughout the episode rather than dropping when ghosts
+appear. A second guess -- that the moving obstacle's own repeated lidar hits accumulate into a
+persistent, full-corridor-width "wall" near its oscillation center under ground truth's exactly
+reproducible scan geometry, and that this (not an indecision loop) is what blocks `plan_path` --
+was tested with a direct instrumentation probe (max contiguous blocked span near the obstacle's
+column, logged every replan) and also RULED OUT: blocked span near the obstacle never exceeded
+~0.6m of the corridor's 2m width, and `n_waypoints=0` events showed no correlation with it.
+
+What the same trace DID show: from ~t=12s onward the robot's position and the obstacle's position
+fell into an almost exactly periodic back-and-forth pattern, synced to the obstacle's own 10s
+oscillation -- advancing to within about 1m of the obstacle's corridor-crossing x-position, then
+retreating, repeating for the remaining 30+ seconds without net progress. That's consistent with
+a genuine resonance lock: under ground truth, `grid.update()` always writes the obstacle's live
+lidar hits at the robot's TRUE pose, so `DynamicObstacleTracker`'s position/velocity estimate of
+the single moving obstacle is essentially noise-free (to grid resolution) and bit-for-bit
+reproducible at every recurrence of the same (robot, obstacle-phase) state -- so the CEM planner's
+velocity-extrapolated collision cost recreates the IDENTICAL "too risky, retreat" verdict every
+single cycle, with nothing to ever perturb it onto the other branch.
+
+Tested directly by isolating JUST that one channel: a temporary flag injected Gaussian noise
+(std 0.15m / 0.15m/s) onto `dynamic_obstacles`' estimated position/velocity ONLY, right before
+the CEM planner call -- robot pose, map, and localization all stayed exact ground truth. Reran
+the 3 bottom-corridor seed/phase combos that had ALL timed out in the main eval: none repeated
+its timeout. Two reached the goal (28.9s, min-dist 0.67m; 41.4s, min-dist 0.77m) and one fell
+(final distance 9.97m, min-dist 0.43m -- a closer, less controlled break from the lock than a
+clean reach). This directly confirms the mechanism: obstacle-estimate imprecision, not general
+"noise helps," is what breaks ground truth's deterministic lock -- and plausibly explains most of
+noisy localization's real advantage too, since `grid.update()` there writes the SAME obstacle's
+live hits at the DRIFTING belief pose, smearing the tracker's position/velocity estimate of it by
+construction (the identical channel Stage 16's main hypothesis already uses to explain ghosting).
+
+**Caveat, stated plainly**: this confirms the mechanism CLASS, not an exact quantitative match --
+the injected noise was independent per-step Gaussian, not the real correlated ICP/odometry drift
+process, and the outcome was MIXED (2 reached, 1 fell) rather than a clean reproduction of the
+real condition's uniform 6/6. Something about the real drift process (its correlation structure,
+or an additional contribution from the robot's own pose uncertainty) likely pushes the actual
+noisy-localization condition to a cleaner outcome than this isolated test did -- that residual gap
+is left open rather than asserted. The debug probe and noise-injection flag used for this
+investigation were both removed afterward (`navigate_wam_moving_obstacle_slam.py` is unchanged
+from its Stage 16 addendum state) -- the finding lives here, not in leftover debug code.
+
+`--icp-degeneracy-filter` doesn't resolve the reversal either -- with the filter, corridor reach
+rate is 5/6 (still far above ground truth's 0/6), and the filter's effect on drift itself is
+inconsistent here too: it cut one trial's drift from 0.44m to 0.03m (eliminating that trial's
+ghost) but made another trial's drift WORSE (0.64m -> 1.05m, turning a reach into a timeout) --
+the same "helps some seeds, hurts others, no uniform win" behavior Stage 13's own addendum already
+established for this flag, now reconfirmed in the ghost-tracking context rather than newly
+discovered.
 
 **Honest overall conclusion**: escalating beyond the single island world was the right call --
 it overturns Stage 16's own main-result framing from "hypothesis refuted" to "hypothesis real,
@@ -2097,8 +2141,12 @@ match_radius," which the default world structurally cannot do. It did NOT uncove
 either of the two mechanisms it touched most (corridor's indecisive-lingering limitation, and
 `--icp-degeneracy-filter`'s inconsistency) -- both are reconfirmations of already-documented
 Stage 10/11 and Stage 13 findings, now shown to recur in this new combination too. The one
-genuinely new, unexplained result (the reach-rate reversal) is flagged as open rather than
-force-fit to a theory that didn't survive direct checking.
+genuinely new result (the reach-rate reversal) is now explained, not left open: ground truth's
+exactly-reproducible obstacle-velocity estimate locks the CEM planner into an identical retreat
+decision every oscillation cycle, and the same belief-drift that drives Stage 16's ghosting also
+smears that estimate enough to break the lock -- confirmed by isolating the channel directly, with
+an honest caveat that the isolated test reproduced the mechanism, not the real condition's exact,
+uniformly-safe outcome.
 
 ## Repository layout
 
